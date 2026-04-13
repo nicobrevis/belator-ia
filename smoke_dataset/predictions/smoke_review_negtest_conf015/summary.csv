@@ -1,0 +1,2 @@
+video,frames_processed,frames_with_detections,detection_frame_ratio,total_detections,mean_confidence,max_confidence
+2.mp4,629,629,1.0,3343,0.48,0.8908
