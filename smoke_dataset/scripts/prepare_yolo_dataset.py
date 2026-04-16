@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from pathlib import Path
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def sort_key(value: str) -> tuple[int, str]:
@@ -36,10 +39,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--val-groups",
         nargs="+",
-        required=True,
+        default=None,
         help=(
             "Video groups to reserve for validation. "
             "The group is the filename prefix before '_f', for example '8' in '8_f000030...jpg'."
+        ),
+    )
+    parser.add_argument(
+        "--val-stride",
+        type=int,
+        default=0,
+        help=(
+            "Hold out every Nth frame for validation within each source group. "
+            "Useful when all images come from a single video. Default: 0"
         ),
     )
     return parser.parse_args()
@@ -49,8 +61,31 @@ def group_name(image_path: Path) -> str:
     return image_path.stem.split("_f", 1)[0]
 
 
+def frame_index(image_path: Path) -> int:
+    match = re.search(r"_f(\d+)", image_path.stem)
+    return int(match.group(1)) if match else 10**12
+
+
+def iter_images(images_dir: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in images_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=lambda path: (group_name(path), frame_index(path), path.name),
+    )
+
+
 def write_split_list(root: Path, split: str) -> None:
-    images = sorted((root / "images" / split).glob("*.jpg"))
+    images = sorted(
+        (
+            path
+            for path in (root / "images" / split).iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=lambda path: path.name,
+    )
     output = root / f"{split}.txt"
     with output.open("w", encoding="utf-8") as f:
         for image in images:
@@ -61,7 +96,13 @@ def main() -> None:
     args = parse_args()
     source_dirs = [path.resolve() for path in args.source_dir]
     output_dir = args.output_dir
-    val_groups = set(args.val_groups)
+    val_groups = set(args.val_groups or [])
+    val_stride = args.val_stride
+
+    if val_groups and val_stride:
+        raise ValueError("Use either --val-groups or --val-stride, not both.")
+    if not val_groups and val_stride <= 0:
+        raise ValueError("Provide --val-groups or a positive --val-stride.")
 
     if output_dir.exists():
         shutil.rmtree(output_dir)
@@ -85,32 +126,48 @@ def main() -> None:
         if not source_labels.exists():
             raise FileNotFoundError(f"Missing source labels folder: {source_labels}")
 
-        image_paths = sorted(source_images.glob("*.jpg"))
+        image_paths = iter_images(source_images)
         if not image_paths:
             raise FileNotFoundError(f"No images found in {source_images}")
+
+        if val_groups:
+            split_assignments = {
+                image_path: ("val" if group_name(image_path) in val_groups else "train")
+                for image_path in image_paths
+            }
+        else:
+            split_assignments = {}
+            grouped_images: dict[str, list[Path]] = {}
+            for image_path in image_paths:
+                grouped_images.setdefault(group_name(image_path), []).append(image_path)
+
+            for grouped_paths in grouped_images.values():
+                for position, image_path in enumerate(grouped_paths):
+                    split_assignments[image_path] = "val" if position % val_stride == 0 else "train"
 
         for image_path in image_paths:
             if image_path.name in seen_names:
                 raise RuntimeError(f"Duplicate image name across exports: {image_path.name}")
             seen_names.add(image_path.name)
 
-            split = "val" if group_name(image_path) in val_groups else "train"
+            split = split_assignments[image_path]
             destination_image = output_dir / "images" / split / image_path.name
             shutil.copy2(image_path, destination_image)
 
             label_path = source_labels / f"{image_path.stem}.txt"
+            is_positive = label_path.exists() and bool(label_path.read_text(encoding="utf-8").strip())
             if label_path.exists():
                 destination_label = output_dir / "labels" / split / label_path.name
                 shutil.copy2(label_path, destination_label)
-                if split == "train":
-                    positive_train += 1
-                else:
-                    positive_val += 1
 
             if split == "train":
                 train_count += 1
+                if is_positive:
+                    positive_train += 1
             else:
                 val_count += 1
+                if is_positive:
+                    positive_val += 1
 
     write_split_list(output_dir, "train")
     write_split_list(output_dir, "val")
@@ -124,7 +181,10 @@ def main() -> None:
 
     print(f"Prepared dataset: {output_dir}")
     print(f"Source exports: {', '.join(str(path) for path in source_dirs)}")
-    print(f"Validation groups: {', '.join(sorted(val_groups, key=sort_key))}")
+    if val_groups:
+        print(f"Validation groups: {', '.join(sorted(val_groups, key=sort_key))}")
+    else:
+        print(f"Validation stride: every {val_stride} frame(s) per source group")
     print(f"Train images: {train_count}")
     print(f"Val images: {val_count}")
     print(f"Train positives: {positive_train}")
