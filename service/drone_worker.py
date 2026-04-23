@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import select
 import threading
 import time
 from pathlib import Path
@@ -21,10 +22,17 @@ from service.settings import ServiceSettings
 
 
 class _FfmpegMjpegReader:
-    def __init__(self, *, ffmpeg_path: str, source: str) -> None:
+    def __init__(
+        self,
+        *,
+        ffmpeg_path: str,
+        source: str,
+        read_timeout_seconds: float = 5.0,
+    ) -> None:
         self.source = source
         self._process: subprocess.Popen[bytes] | None = None
         self._buffer = bytearray()
+        self._read_timeout_seconds = max(0.5, float(read_timeout_seconds))
         self._command = [
             ffmpeg_path,
             "-hide_banner",
@@ -32,6 +40,8 @@ class _FfmpegMjpegReader:
             "error",
             "-rtsp_transport",
             "tcp",
+            "-timeout",
+            str(int(self._read_timeout_seconds * 1_000_000)),
             "-fflags",
             "nobuffer",
             "-flags",
@@ -65,6 +75,7 @@ class _FfmpegMjpegReader:
         if not self._process or not self._process.stdout:
             return False, None
 
+        stdout = self._process.stdout
         start_marker = b"\xff\xd8"
         end_marker = b"\xff\xd9"
 
@@ -78,7 +89,16 @@ class _FfmpegMjpegReader:
                     frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                     return (frame is not None), frame
 
-            chunk = self._process.stdout.read(4 * 1024)
+            try:
+                ready, _, _ = select.select([stdout], [], [], self._read_timeout_seconds)
+            except (OSError, ValueError):
+                return False, None
+            if not ready:
+                # ffmpeg can hang with an open socket and stop producing bytes.
+                # Return False so the worker reconnects the source automatically.
+                return False, None
+
+            chunk = stdout.read(4 * 1024)
             if not chunk:
                 return False, None
             self._buffer.extend(chunk)
@@ -377,7 +397,15 @@ class DroneWorker:
     def _open_capture(self, source: str):
         normalized = source.strip().lower()
         if normalized.startswith("rtsp://"):
-            return _FfmpegMjpegReader(ffmpeg_path=self.settings.ffmpeg_path, source=source)
+            capture = cv2.VideoCapture(source)
+            if capture.isOpened():
+                return capture
+            capture.release()
+            return _FfmpegMjpegReader(
+                ffmpeg_path=self.settings.ffmpeg_path,
+                source=source,
+                read_timeout_seconds=self.settings.rtsp_read_timeout_seconds,
+            )
         return cv2.VideoCapture(source)
 
     @staticmethod
