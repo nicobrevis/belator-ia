@@ -57,6 +57,10 @@ class _FfmpegMjpegReader:
     def isOpened(self) -> bool:  # noqa: N802
         return bool(self._process and self._process.stdout and self._process.poll() is None)
 
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process else None
+
     def read(self):
         if not self._process or not self._process.stdout:
             return False, None
@@ -122,6 +126,19 @@ class DroneWorker:
             "status": "configured",
             "message": "",
             "sourceOpened": False,
+            "sourceType": "unknown",
+            "sourceUrl": "",
+            "captureBackend": "",
+            "capturePid": None,
+            "activeRtspConnections": 0,
+            "maxRtspConnections": 1,
+            "singleIngestHealthy": True,
+            "sourceSessionId": "",
+            "sourceOpenCount": 0,
+            "sourceReconnectCount": 0,
+            "lastSourceOpenAt": "",
+            "lastSourceCloseAt": "",
+            "lastSourceError": "",
             "frameWidth": None,
             "frameHeight": None,
             "sourceFps": None,
@@ -212,14 +229,26 @@ class DroneWorker:
             )
             if not pipeline.get("analyticsEnabled", True):
                 self._clear_preview()
-                self._set_runtime(status="disabled", message="analytics disabled", sourceOpened=False)
+                self._set_runtime(
+                    status="disabled",
+                    message="analytics disabled",
+                    sourceOpened=False,
+                    activeRtspConnections=0,
+                    singleIngestHealthy=True,
+                )
                 time.sleep(0.5)
                 continue
 
             source = str(pipeline.get("rtspUrl") or "").strip()
             if not source:
                 self._clear_preview()
-                self._set_runtime(status="waiting_source", message="missing source URL", sourceOpened=False)
+                self._set_runtime(
+                    status="waiting_source",
+                    message="missing source URL",
+                    sourceOpened=False,
+                    activeRtspConnections=0,
+                    singleIngestHealthy=True,
+                )
                 time.sleep(self.settings.reconnect_delay_seconds)
                 continue
 
@@ -227,7 +256,15 @@ class DroneWorker:
             if source_path.exists() and (
                 source_path.is_dir() or source_path.suffix.lower() in {".jpg", ".jpeg", ".png"}
             ):
+                self._mark_source_open(
+                    source=source,
+                    source_type="image",
+                    capture_backend="image-loader",
+                    capture_pid=None,
+                    source_fps=0.0,
+                )
                 self._process_image_source(source_path)
+                self._mark_source_closed(last_error="")
                 if not self._stop_event.is_set():
                     time.sleep(self.settings.reconnect_delay_seconds)
                 continue
@@ -239,20 +276,36 @@ class DroneWorker:
                     status="waiting_source",
                     message=f"could not open source {source}",
                     sourceOpened=False,
+                    activeRtspConnections=0,
+                    singleIngestHealthy=True,
+                    lastSourceError=f"could not open source {self._sanitize_source_url(source)}",
                 )
                 capture.release()
                 time.sleep(self.settings.reconnect_delay_seconds)
                 continue
 
             source_fps = self._capture_fps(capture)
-            self._set_runtime(status="starting", message="source opened", sourceOpened=True, sourceFps=source_fps)
+            self._mark_source_open(
+                source=source,
+                source_type="rtsp" if source.strip().lower().startswith("rtsp://") else "video",
+                capture_backend=self._capture_backend_name(capture),
+                capture_pid=self._capture_pid(capture),
+                source_fps=source_fps,
+            )
             last_processed_at = 0.0
 
             while not self._stop_event.is_set():
                 ok, frame = capture.read()
                 if not ok or frame is None:
                     self._clear_preview()
-                    self._set_runtime(status="waiting_source", message="source frame read failed", sourceOpened=False)
+                    self._set_runtime(
+                        status="waiting_source",
+                        message="source frame read failed",
+                        sourceOpened=False,
+                        activeRtspConnections=0,
+                        singleIngestHealthy=True,
+                        lastSourceError="source frame read failed",
+                    )
                     break
 
                 now = time.monotonic()
@@ -271,6 +324,7 @@ class DroneWorker:
                 self._process_frame(frame, source_fps=source_fps, pipeline=pipeline)
 
             capture.release()
+            self._mark_source_closed(last_error="")
             if not self._stop_event.is_set():
                 time.sleep(self.settings.reconnect_delay_seconds)
 
@@ -325,6 +379,18 @@ class DroneWorker:
         if normalized.startswith("rtsp://"):
             return _FfmpegMjpegReader(ffmpeg_path=self.settings.ffmpeg_path, source=source)
         return cv2.VideoCapture(source)
+
+    @staticmethod
+    def _capture_backend_name(capture) -> str:
+        if isinstance(capture, _FfmpegMjpegReader):
+            return "ffmpeg-mjpeg-reader"
+        return "opencv-videocapture"
+
+    @staticmethod
+    def _capture_pid(capture) -> int | None:
+        if isinstance(capture, _FfmpegMjpegReader):
+            return capture.pid
+        return None
 
     @staticmethod
     def _capture_fps(capture) -> float:
@@ -508,6 +574,7 @@ class DroneWorker:
                         else f"idle, model {self._model_name or self._model_id}"
                     ),
                     "sourceOpened": True,
+                    "singleIngestHealthy": int(self._runtime.get("activeRtspConnections") or 0) <= 1,
                     "frameWidth": frame_width,
                     "frameHeight": frame_height,
                     "sourceFps": round(source_fps, 2) if source_fps else None,
@@ -545,6 +612,66 @@ class DroneWorker:
     def _set_runtime(self, **updates) -> None:
         with self._lock:
             self._runtime.update(updates)
+
+    @staticmethod
+    def _sanitize_source_url(source: str) -> str:
+        value = str(source or "").strip()
+        if not value.lower().startswith("rtsp://"):
+            return value
+        scheme, _, rest = value.partition("://")
+        if "@" not in rest:
+            return value
+        credentials, _, host = rest.partition("@")
+        if ":" not in credentials:
+            return f"{scheme}://{credentials}@{host}"
+        username, _, _password = credentials.partition(":")
+        return f"{scheme}://{username}:******@{host}"
+
+    def _mark_source_open(
+        self,
+        *,
+        source: str,
+        source_type: str,
+        capture_backend: str,
+        capture_pid: int | None,
+        source_fps: float,
+    ) -> None:
+        with self._lock:
+            source_open_count = int(self._runtime.get("sourceOpenCount") or 0) + 1
+            active_rtsp_connections = 1 if source_type == "rtsp" else 0
+            self._runtime.update(
+                {
+                    "status": "starting",
+                    "message": "source opened",
+                    "sourceOpened": True,
+                    "sourceType": source_type,
+                    "sourceUrl": self._sanitize_source_url(source),
+                    "captureBackend": capture_backend,
+                    "capturePid": capture_pid,
+                    "sourceFps": source_fps,
+                    "activeRtspConnections": active_rtsp_connections,
+                    "maxRtspConnections": 1,
+                    "singleIngestHealthy": active_rtsp_connections <= 1,
+                    "sourceSessionId": f"{self.pipeline_id}-source-{source_open_count}",
+                    "sourceOpenCount": source_open_count,
+                    "sourceReconnectCount": max(0, source_open_count - 1),
+                    "lastSourceOpenAt": utc_now(),
+                    "lastSourceError": "",
+                }
+            )
+
+    def _mark_source_closed(self, *, last_error: str) -> None:
+        with self._lock:
+            self._runtime.update(
+                {
+                    "sourceOpened": False,
+                    "activeRtspConnections": 0,
+                    "singleIngestHealthy": True,
+                    "capturePid": None,
+                    "lastSourceCloseAt": utc_now(),
+                    "lastSourceError": str(last_error or self._runtime.get("lastSourceError") or ""),
+                }
+            )
 
     @staticmethod
     def _overlay_status(frame, *, model_name: str, detection_count: int, max_confidence: float, sensor_type: str) -> None:
