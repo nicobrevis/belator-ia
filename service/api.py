@@ -33,13 +33,36 @@ class AnalyticsServiceApp:
         query = parse_qs(parsed.query)
 
         if path == "/health" and handler.command == "GET":
+            pipelines = self.pipeline_manager.list_pipelines()
+            active_rtsp_connections = 0
+            pipelines_source_opened = 0
+            pipelines_over_limit = 0
+
+            for pipeline in pipelines:
+                runtime = pipeline.get("runtime") if isinstance(pipeline, dict) else {}
+                runtime_record = runtime if isinstance(runtime, dict) else {}
+                source_opened = bool(runtime_record.get("sourceOpened"))
+                active_connections = int(runtime_record.get("activeRtspConnections") or 0)
+
+                if source_opened:
+                    pipelines_source_opened += 1
+                active_rtsp_connections += max(active_connections, 0)
+                if active_connections > 1:
+                    pipelines_over_limit += 1
+
             return self._send_json(
                 handler,
                 {
                     "ok": True,
                     "service": "pyrone-analytics",
                     "storage": self.nvr_store.storage_summary(),
-                    "pipelineCount": len(self.pipeline_manager.list_pipelines()),
+                    "pipelineCount": len(pipelines),
+                    "singleIngest": {
+                        "activeRtspConnections": active_rtsp_connections,
+                        "pipelinesSourceOpened": pipelines_source_opened,
+                        "pipelinesOverLimit": pipelines_over_limit,
+                        "healthy": pipelines_over_limit == 0,
+                    },
                 },
             )
 
