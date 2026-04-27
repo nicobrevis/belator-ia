@@ -292,10 +292,11 @@ class AnalyticsServiceApp:
         variant: str = "processed",
     ) -> None:
         boundary = "frame"
-        frame_interval = 1.0 / max(1.0, float(self.settings.processing_fps))
         pipeline = self.pipeline_manager.get_pipeline(drone_id)
         if pipeline is None:
             return self._send_json(handler, {"error": "pipeline not found"}, status=404)
+
+        frame_interval = self._frame_interval_for_pipeline(pipeline)
 
         handler.send_response(200)
         handler.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={boundary}")
@@ -319,6 +320,26 @@ class AnalyticsServiceApp:
                 time.sleep(frame_interval)
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    def _frame_interval_for_pipeline(self, pipeline: dict[str, object]) -> float:
+        runtime = pipeline.get("runtime") if isinstance(pipeline.get("runtime"), dict) else {}
+        candidates = [
+            runtime.get("processingFps") if isinstance(runtime, dict) else None,
+            pipeline.get("processingFps"),
+            self.settings.processing_fps,
+        ]
+
+        target_fps = 1.0
+        for candidate in candidates:
+            try:
+                parsed = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                target_fps = min(max(parsed, 1.0), 30.0)
+                break
+
+        return 1.0 / target_fps
 
 
 def build_handler(app: AnalyticsServiceApp):
