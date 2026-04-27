@@ -33,6 +33,7 @@ class _FfmpegMjpegReader:
         self._process: subprocess.Popen[bytes] | None = None
         self._buffer = bytearray()
         self._read_timeout_seconds = max(0.5, float(read_timeout_seconds))
+        self._startup_deadline = time.monotonic() + max(self._read_timeout_seconds * 3.0, 12.0)
         self._command = [
             ffmpeg_path,
             "-hide_banner",
@@ -40,12 +41,16 @@ class _FfmpegMjpegReader:
             "error",
             "-rtsp_transport",
             "tcp",
-            "-timeout",
-            str(int(self._read_timeout_seconds * 1_000_000)),
             "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
+            "+genpts+discardcorrupt",
+            "-analyzeduration",
+            "1000000",
+            "-probesize",
+            "1000000",
+            "-rtbufsize",
+            "100M",
+            "-use_wallclock_as_timestamps",
+            "1",
             "-i",
             source,
             "-an",
@@ -94,6 +99,8 @@ class _FfmpegMjpegReader:
             except (OSError, ValueError):
                 return False, None
             if not ready:
+                if time.monotonic() < self._startup_deadline:
+                    continue
                 # ffmpeg can hang with an open socket and stop producing bytes.
                 # Return False so the worker reconnects the source automatically.
                 return False, None
@@ -102,6 +109,8 @@ class _FfmpegMjpegReader:
             if not chunk:
                 return False, None
             self._buffer.extend(chunk)
+            if self._startup_deadline:
+                self._startup_deadline = 0.0
             if len(self._buffer) > 8 * 1024 * 1024:
                 del self._buffer[: 4 * 1024 * 1024]
 
@@ -397,15 +406,20 @@ class DroneWorker:
     def _open_capture(self, source: str):
         normalized = source.strip().lower()
         if normalized.startswith("rtsp://"):
-            capture = cv2.VideoCapture(source)
-            if capture.isOpened():
-                return capture
-            capture.release()
-            return _FfmpegMjpegReader(
+            ffmpeg_reader = _FfmpegMjpegReader(
                 ffmpeg_path=self.settings.ffmpeg_path,
                 source=source,
                 read_timeout_seconds=self.settings.rtsp_read_timeout_seconds,
             )
+            if ffmpeg_reader.isOpened():
+                return ffmpeg_reader
+            ffmpeg_reader.release()
+
+            capture = cv2.VideoCapture(source)
+            if capture.isOpened():
+                return capture
+            capture.release()
+            return ffmpeg_reader
         return cv2.VideoCapture(source)
 
     @staticmethod
