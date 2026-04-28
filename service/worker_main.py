@@ -86,7 +86,7 @@ class SingleDroneWorkerProcess:
                         last_pipeline_mtime = current_mtime
 
                 self._publish_worker_state(worker)
-                time.sleep(0.35)
+                time.sleep(0.05)
         finally:
             worker.stop()
             runtime = worker.runtime_snapshot()

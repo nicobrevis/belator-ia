@@ -301,12 +301,7 @@ class PipelineManager:
             self._pipelines.pop(drone_id, None)
 
     def _cleanup_orphaned_publishers(self) -> None:
-        active_output_urls = {
-            self.settings.processed_publish_url(str(pipeline["droneId"]))
-            for pipeline in self._pipelines.values()
-            if pipeline.get("analyticsEnabled")
-        }
-        cleanup_orphaned_processed_publishers(active_output_urls)
+        cleanup_orphaned_processed_publishers(set())
 
     @staticmethod
     def _source_key(source: str) -> str:
