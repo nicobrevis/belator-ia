@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 
-from service.drone_worker import DroneWorker, cleanup_orphaned_processed_publishers
+from service.drone_worker import cleanup_orphaned_processed_publishers
 from service.model_registry import ModelRegistry
 from service.nvr_store import NvrStore
 from service.retention import RetentionManager
 from service.schemas import normalize_pipeline_payload, normalize_pipeline_state_payload, utc_now
 from service.settings import ServiceSettings
+from service.worker_process import DroneWorkerProcess, terminate_drone_worker_process
 
 
 class PipelineManager:
@@ -23,7 +24,7 @@ class PipelineManager:
         self.store = store
         self.retention_manager = retention_manager
         self._pipelines: dict[str, dict[str, object]] = {}
-        self._workers: dict[str, DroneWorker] = {}
+        self._workers: dict[str, DroneWorkerProcess] = {}
         self._load()
         self._deduplicate_sources()
         self._cleanup_orphaned_publishers()
@@ -71,6 +72,14 @@ class PipelineManager:
             return None
         self._stop_worker(str(drone_id or "").strip())
         self._persist()
+        return self._copy_pipeline(pipeline)
+
+    def restart_pipeline(self, drone_id: str) -> dict[str, object]:
+        key = str(drone_id or "").strip()
+        pipeline = self._pipelines.get(key)
+        if pipeline is None:
+            raise KeyError(key)
+        self._ensure_worker(key, restart=True)
         return self._copy_pipeline(pipeline)
 
     def update_runtime_state(self, drone_id: str, payload: dict[str, object] | None) -> dict[str, object]:
@@ -261,12 +270,9 @@ class PipelineManager:
             self._stop_worker(drone_id)
             worker = None
         if worker is None:
-            worker = DroneWorker(
+            worker = DroneWorkerProcess(
                 settings=self.settings,
-                model_registry=self.model_registry,
-                store=self.store,
                 pipeline=pipeline,
-                on_recording_saved=self._handle_recording_saved,
             )
             self._workers[drone_id] = worker
             worker.start()
@@ -277,6 +283,8 @@ class PipelineManager:
         worker = self._workers.pop(drone_id, None)
         if worker:
             worker.stop()
+        else:
+            terminate_drone_worker_process(self.settings, drone_id)
 
     def _remove_duplicate_source_pipelines(self, *, keep_drone_id: str, source: str) -> None:
         source_key = self._source_key(source)

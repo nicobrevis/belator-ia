@@ -107,6 +107,17 @@ class AnalyticsServiceApp:
                 return self._send_json(handler, {"error": "pipeline not found"}, status=404)
             return self._send_json(handler, pipeline)
 
+        pipeline_restart_match = re.fullmatch(r"/v1/pipelines/([^/]+)/restart", path)
+        if pipeline_restart_match:
+            if handler.command != "POST":
+                return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            drone_id = pipeline_restart_match.group(1)
+            try:
+                pipeline = self.pipeline_manager.restart_pipeline(drone_id)
+            except KeyError:
+                return self._send_json(handler, {"error": "pipeline not found"}, status=404)
+            return self._send_json(handler, {"ok": True, "pipeline": pipeline})
+
         frame_match = re.fullmatch(r"/v1/pipelines/([^/]+)/frame\.jpg", path)
         if frame_match:
             if handler.command != "GET":
