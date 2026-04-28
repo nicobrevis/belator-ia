@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from service.drone_worker import DroneWorker
+from service.drone_worker import DroneWorker, cleanup_orphaned_processed_publishers
 from service.model_registry import ModelRegistry
 from service.nvr_store import NvrStore
 from service.retention import RetentionManager
@@ -25,6 +25,8 @@ class PipelineManager:
         self._pipelines: dict[str, dict[str, object]] = {}
         self._workers: dict[str, DroneWorker] = {}
         self._load()
+        self._deduplicate_sources()
+        self._cleanup_orphaned_publishers()
         self._ensure_workers()
 
     def list_pipelines(self) -> list[dict[str, object]]:
@@ -54,8 +56,13 @@ class PipelineManager:
         }
         restart_required = self._worker_restart_required(previous, next_pipeline)
         self._pipelines[str(next_pipeline["droneId"])] = next_pipeline
+        self._remove_duplicate_source_pipelines(
+            keep_drone_id=str(next_pipeline["droneId"]),
+            source=str(next_pipeline.get("rtspUrl") or ""),
+        )
         self._persist()
         self._ensure_worker(str(next_pipeline["droneId"]), restart=restart_required)
+        self._cleanup_orphaned_publishers()
         return self._copy_pipeline(next_pipeline)
 
     def delete_pipeline(self, drone_id: str) -> dict[str, object] | None:
@@ -139,6 +146,26 @@ class PipelineManager:
             pipeline["processedRtspUrl"] = self.settings.processed_stream_url(drone_id)
             pipeline["status"] = self._status_for_pipeline(pipeline, item)
             self._pipelines[drone_id] = pipeline
+
+    def _deduplicate_sources(self) -> None:
+        seen_sources: set[str] = set()
+        keep_order = sorted(
+            self._pipelines.items(),
+            key=lambda item: str(item[1].get("updatedAt") or item[1].get("createdAt") or ""),
+            reverse=True,
+        )
+
+        for drone_id, pipeline in keep_order:
+            source = self._source_key(str(pipeline.get("rtspUrl") or ""))
+
+            if not source:
+                continue
+
+            if source in seen_sources:
+                self._pipelines.pop(drone_id, None)
+                continue
+
+            seen_sources.add(source)
 
     def _persist(self) -> None:
         payload = {
@@ -248,6 +275,32 @@ class PipelineManager:
         worker = self._workers.pop(drone_id, None)
         if worker:
             worker.stop()
+
+    def _remove_duplicate_source_pipelines(self, *, keep_drone_id: str, source: str) -> None:
+        source_key = self._source_key(source)
+
+        if not source_key:
+            return
+
+        for drone_id, pipeline in list(self._pipelines.items()):
+            if drone_id == keep_drone_id:
+                continue
+            if self._source_key(str(pipeline.get("rtspUrl") or "")) != source_key:
+                continue
+            self._stop_worker(drone_id)
+            self._pipelines.pop(drone_id, None)
+
+    def _cleanup_orphaned_publishers(self) -> None:
+        active_output_urls = {
+            self.settings.processed_stream_url(str(pipeline["droneId"]))
+            for pipeline in self._pipelines.values()
+            if pipeline.get("analyticsEnabled")
+        }
+        cleanup_orphaned_processed_publishers(active_output_urls)
+
+    @staticmethod
+    def _source_key(source: str) -> str:
+        return str(source or "").strip().lower()
 
     def _handle_recording_saved(self, _recording: dict[str, object]) -> None:
         self.retention_manager.enforce()

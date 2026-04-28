@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from collections import deque
 import hashlib
+import os
 import queue
 import select
+import signal
 import threading
 import time
 from pathlib import Path
@@ -21,6 +23,90 @@ from service.nvr_store import NvrStore
 from service.recorder import EventRecorder
 from service.schemas import utc_now
 from service.settings import ServiceSettings
+
+
+def _ffmpeg_processes() -> list[tuple[int, list[str]]]:
+    processes: list[tuple[int, list[str]]] = []
+    proc_root = Path("/proc")
+
+    if not proc_root.exists():
+        return processes
+
+    for cmdline_path in proc_root.glob("[0-9]*/cmdline"):
+        try:
+            pid = int(cmdline_path.parent.name)
+            raw_cmdline = cmdline_path.read_bytes()
+        except (OSError, ValueError):
+            continue
+
+        if not raw_cmdline:
+            continue
+
+        command = [part.decode("utf-8", errors="ignore") for part in raw_cmdline.split(b"\0") if part]
+
+        if not command or "ffmpeg" not in Path(command[0]).name.lower():
+            continue
+
+        processes.append((pid, command))
+
+    return processes
+
+
+def _terminate_ffmpeg_process(pid: int) -> None:
+    if pid <= 0 or pid == os.getpid():
+        return
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        return
+
+
+def _terminate_matching_ffmpeg_processes(
+    match_value: str,
+    *,
+    required_tokens: tuple[str, ...] = (),
+    exclude_pid: int | None = None,
+) -> None:
+    if not match_value:
+        return
+
+    for pid, command in _ffmpeg_processes():
+        if exclude_pid and pid == exclude_pid:
+            continue
+        if match_value not in command:
+            continue
+        if any(token not in command for token in required_tokens):
+            continue
+        _terminate_ffmpeg_process(pid)
+
+
+def cleanup_orphaned_processed_publishers(active_output_urls: set[str]) -> None:
+    for pid, command in _ffmpeg_processes():
+        output_url = next((part for part in command if "/processed/" in part and part.startswith("rtsp://")), "")
+
+        if not output_url or output_url in active_output_urls:
+            continue
+
+        if "rawvideo" not in command or "rtsp" not in command:
+            continue
+
+        _terminate_ffmpeg_process(pid)
 
 
 class _FfmpegMjpegReader:
@@ -41,6 +127,7 @@ class _FfmpegMjpegReader:
         self._stale_frame_timeout_seconds = max(self._read_timeout_seconds * 2.0, 6.0)
         self._stale_frame_count = 30
         self._startup_deadline = time.monotonic() + max(self._read_timeout_seconds * 3.0, 12.0)
+        _terminate_matching_ffmpeg_processes(source, required_tokens=("image2pipe",))
         self._command = [
             ffmpeg_path,
             "-hide_banner",
@@ -183,6 +270,10 @@ class _RtspFramePublisher:
         self._last_error = ""
         self._write_started_at = 0.0
         self._thread: threading.Thread | None = None
+        _terminate_matching_ffmpeg_processes(
+            output_url,
+            required_tokens=("rawvideo", "rtsp"),
+        )
         gop = max(2, int(round(self.fps * 2)))
         self._command = [
             ffmpeg_path,
