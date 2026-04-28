@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import hashlib
 import select
 import threading
 import time
@@ -33,6 +34,11 @@ class _FfmpegMjpegReader:
         self._process: subprocess.Popen[bytes] | None = None
         self._buffer = bytearray()
         self._read_timeout_seconds = max(0.5, float(read_timeout_seconds))
+        self._duplicate_frame_count = 0
+        self._last_frame_digest: bytes | None = None
+        self._last_unique_frame_at = time.monotonic()
+        self._stale_frame_timeout_seconds = max(self._read_timeout_seconds * 2.0, 6.0)
+        self._stale_frame_count = 30
         self._startup_deadline = time.monotonic() + max(self._read_timeout_seconds * 3.0, 12.0)
         self._command = [
             ffmpeg_path,
@@ -91,6 +97,8 @@ class _FfmpegMjpegReader:
                 if end_index != -1:
                     jpeg_bytes = bytes(self._buffer[start_index : end_index + 2])
                     del self._buffer[: end_index + 2]
+                    if self._is_stale_duplicate_frame(jpeg_bytes):
+                        return False, None
                     frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                     return (frame is not None), frame
 
@@ -113,6 +121,22 @@ class _FfmpegMjpegReader:
                 self._startup_deadline = 0.0
             if len(self._buffer) > 8 * 1024 * 1024:
                 del self._buffer[: 4 * 1024 * 1024]
+
+    def _is_stale_duplicate_frame(self, jpeg_bytes: bytes) -> bool:
+        digest = hashlib.blake2s(jpeg_bytes, digest_size=8).digest()
+        now = time.monotonic()
+
+        if digest != self._last_frame_digest:
+            self._last_frame_digest = digest
+            self._last_unique_frame_at = now
+            self._duplicate_frame_count = 0
+            return False
+
+        self._duplicate_frame_count += 1
+        return (
+            self._duplicate_frame_count >= self._stale_frame_count
+            and now - self._last_unique_frame_at >= self._stale_frame_timeout_seconds
+        )
 
     def release(self) -> None:
         process = self._process
