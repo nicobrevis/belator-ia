@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
+from fractions import Fraction
 import hashlib
 import os
 import queue
@@ -11,6 +13,8 @@ import time
 from pathlib import Path
 import subprocess
 from time import perf_counter
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
@@ -429,6 +433,216 @@ class _RtspFramePublisher:
                 thread.join(timeout=1.0)
 
 
+class _WhipFramePublisher:
+    def __init__(
+        self,
+        *,
+        output_url: str,
+        width: int,
+        height: int,
+        fps: float,
+        startup_timeout_seconds: float,
+    ) -> None:
+        self.output_url = output_url
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(float(fps or 1.0), 1.0)
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._failed_event = threading.Event()
+        self._lock = threading.Lock()
+        self._last_error = ""
+        self._pc = None
+        self._session_url = ""
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name=f"pyrone-whip-publisher-{self.width}x{self.height}",
+            daemon=True,
+        )
+        self._thread.start()
+
+        if not self._ready_event.wait(timeout=max(2.0, float(startup_timeout_seconds))):
+            error = self.error or "WHIP publisher startup timed out"
+            self.release()
+            raise RuntimeError(error)
+
+    @property
+    def pid(self) -> int | None:
+        return None
+
+    @property
+    def error(self) -> str:
+        with self._lock:
+            return self._last_error
+
+    def is_running(self) -> bool:
+        return self._ready_event.is_set() and not self._failed_event.is_set() and not self._stop_event.is_set()
+
+    def write(self, frame) -> bool:
+        if not self.is_running():
+            return False
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            return False
+
+        try:
+            payload = np.ascontiguousarray(frame)
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._queue.put_nowait(payload)
+            return True
+        except queue.Full:
+            return False
+
+    def release(self) -> None:
+        self._stop_event.set()
+
+        try:
+            if self._queue.full():
+                self._queue.get_nowait()
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+
+        if self._session_url:
+            self._delete_session(self._session_url)
+            self._session_url = ""
+
+    def _thread_main(self) -> None:
+        try:
+            asyncio.run(self._run())
+        except Exception as error:
+            self._mark_failed(str(error))
+
+    async def _run(self) -> None:
+        try:
+            from aiortc import (
+                RTCConfiguration,
+                RTCPeerConnection,
+                RTCRtpSender,
+                RTCSessionDescription,
+                VideoStreamTrack,
+            )
+            from aiortc.mediastreams import MediaStreamError
+            import av
+        except Exception as error:
+            raise RuntimeError(
+                "aiortc/av no está instalado; instala aiortc para publicar IA por WHIP"
+            ) from error
+
+        publisher = self
+
+        class LatestFrameTrack(VideoStreamTrack):
+            kind = "video"
+
+            def __init__(self) -> None:
+                super().__init__()
+                self._timestamp = 0
+                self._time_base = Fraction(1, 90000)
+                self._frame_duration = max(1, int(round(90000 / publisher.fps)))
+
+            async def recv(self):
+                frame = await asyncio.to_thread(publisher._queue.get)
+
+                if frame is None or publisher._stop_event.is_set():
+                    raise MediaStreamError
+
+                video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+                video_frame.pts = self._timestamp
+                video_frame.time_base = self._time_base
+                self._timestamp += self._frame_duration
+                return video_frame
+
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        self._pc = pc
+        transceiver = pc.addTransceiver(LatestFrameTrack(), direction="sendonly")
+
+        try:
+            capabilities = RTCRtpSender.getCapabilities("video")
+            preferred_codecs = [
+                codec
+                for codec in capabilities.codecs
+                if codec.mimeType.lower() == "video/h264"
+            ] + [
+                codec
+                for codec in capabilities.codecs
+                if codec.mimeType.lower() != "video/h264"
+            ]
+            transceiver.setCodecPreferences(preferred_codecs)
+        except Exception:
+            pass
+
+        @pc.on("connectionstatechange")
+        async def on_connection_state_change() -> None:
+            if pc.connectionState in {"failed", "closed", "disconnected"}:
+                publisher._mark_failed(f"WHIP connection {pc.connectionState}")
+
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        await self._wait_for_ice_gathering_complete(pc)
+
+        answer_sdp, session_url = await asyncio.to_thread(
+            self._post_offer,
+            self.output_url,
+            pc.localDescription.sdp,
+        )
+        self._session_url = session_url
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
+
+        self._ready_event.set()
+
+        while not self._stop_event.is_set() and not self._failed_event.is_set():
+            await asyncio.sleep(0.25)
+
+        await pc.close()
+
+    async def _wait_for_ice_gathering_complete(self, pc) -> None:
+        if pc.iceGatheringState == "complete":
+            return
+
+        deadline = time.monotonic() + 3.0
+
+        while pc.iceGatheringState != "complete" and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    def _post_offer(self, url: str, sdp: str) -> tuple[str, str]:
+        request = Request(
+            url,
+            data=sdp.encode("utf-8"),
+            headers={"Content-Type": "application/sdp"},
+            method="POST",
+        )
+
+        with urlopen(request, timeout=10) as response:
+            answer_sdp = response.read().decode("utf-8", errors="replace")
+            location = response.headers.get("Location") or ""
+
+        if not answer_sdp.strip():
+            raise RuntimeError("WHIP endpoint returned an empty SDP answer")
+
+        return answer_sdp, urljoin(url, location) if location else ""
+
+    def _delete_session(self, session_url: str) -> None:
+        try:
+            request = Request(session_url, method="DELETE")
+            urlopen(request, timeout=3).close()
+        except Exception:
+            pass
+
+    def _mark_failed(self, error: str) -> None:
+        with self._lock:
+            self._last_error = error
+        self._failed_event.set()
+        self._ready_event.set()
+
+
 class DroneWorker:
     def __init__(
         self,
@@ -449,8 +663,8 @@ class DroneWorker:
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
-        self._processed_publisher: _RtspFramePublisher | None = None
-        self._processed_publisher_signature: tuple[str, int, int, int] | None = None
+        self._processed_publisher: _RtspFramePublisher | _WhipFramePublisher | None = None
+        self._processed_publisher_signature: tuple[str, str, int, int, int] | None = None
         self._active_capture = None
         self._runtime = {
             "status": "configured",
@@ -883,6 +1097,9 @@ class DroneWorker:
     def _processed_stream_url(self) -> str:
         return self.settings.processed_stream_url(self.pipeline_id)
 
+    def _processed_publish_url(self) -> str:
+        return self.settings.processed_publish_url(self.pipeline_id)
+
     def _stop_processed_publisher(self) -> None:
         publisher = self._processed_publisher
         self._processed_publisher = None
@@ -892,7 +1109,7 @@ class DroneWorker:
         self._set_runtime(
             processedStreamReady=False,
             processedPublisherPid=None,
-            processedStreamUrl=self._processed_stream_url(),
+            processedStreamUrl=self._processed_publish_url(),
         )
 
     def _publish_processed_frame(self, frame, *, fps: float) -> None:
@@ -900,10 +1117,12 @@ class DroneWorker:
             self._stop_processed_publisher()
             return
 
+        frame = self._ensure_even_frame(frame)
         frame_height, frame_width = frame.shape[:2]
         rounded_fps = max(1, int(round(float(fps or self.settings.processing_fps))))
-        output_url = self._processed_stream_url()
-        signature = (output_url, frame_width, frame_height, rounded_fps)
+        output_url = self._processed_publish_url()
+        transport = self.settings.processed_publish_transport
+        signature = (transport, output_url, frame_width, frame_height, rounded_fps)
 
         if (
             self._processed_publisher_signature != signature
@@ -912,17 +1131,26 @@ class DroneWorker:
         ):
             self._stop_processed_publisher()
             try:
-                self._processed_publisher = _RtspFramePublisher(
-                    ffmpeg_path=self.settings.ffmpeg_path,
-                    output_url=output_url,
-                    width=frame_width,
-                    height=frame_height,
-                    fps=float(rounded_fps),
-                    bitrate=self.settings.processed_rtsp_bitrate,
-                    bufsize=self.settings.processed_rtsp_bufsize,
-                    preset=self.settings.processed_rtsp_preset,
-                    write_timeout_seconds=self.settings.processed_rtsp_write_timeout_seconds,
-                )
+                if transport == "whip":
+                    self._processed_publisher = _WhipFramePublisher(
+                        output_url=output_url,
+                        width=frame_width,
+                        height=frame_height,
+                        fps=float(rounded_fps),
+                        startup_timeout_seconds=self.settings.rtsp_read_timeout_seconds,
+                    )
+                else:
+                    self._processed_publisher = _RtspFramePublisher(
+                        ffmpeg_path=self.settings.ffmpeg_path,
+                        output_url=output_url,
+                        width=frame_width,
+                        height=frame_height,
+                        fps=float(rounded_fps),
+                        bitrate=self.settings.processed_rtsp_bitrate,
+                        bufsize=self.settings.processed_rtsp_bufsize,
+                        preset=self.settings.processed_rtsp_preset,
+                        write_timeout_seconds=self.settings.processed_rtsp_write_timeout_seconds,
+                    )
                 self._processed_publisher_signature = signature
             except Exception as error:
                 self._set_runtime(
@@ -941,6 +1169,24 @@ class DroneWorker:
             processedStreamReady=True,
             processedStreamUrl=output_url,
             processedPublisherPid=self._processed_publisher.pid,
+        )
+
+    @staticmethod
+    def _ensure_even_frame(frame):
+        frame_height, frame_width = frame.shape[:2]
+        pad_bottom = frame_height % 2
+        pad_right = frame_width % 2
+
+        if not pad_bottom and not pad_right:
+            return frame
+
+        return cv2.copyMakeBorder(
+            frame,
+            0,
+            pad_bottom,
+            0,
+            pad_right,
+            cv2.BORDER_REPLICATE,
         )
 
     def _clear_processed_preview(self) -> None:

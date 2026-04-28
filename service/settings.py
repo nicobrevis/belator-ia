@@ -50,6 +50,8 @@ class ServiceSettings:
     processed_rtsp_host: str
     processed_rtsp_port: int
     processed_rtsp_url_template: str
+    processed_publish_transport: str
+    processed_whip_url_template: str
     processed_rtsp_enabled: bool
     processed_rtsp_bitrate: str
     processed_rtsp_bufsize: str
@@ -81,6 +83,15 @@ class ServiceSettings:
             )
 
         return f"rtsp://{self.processed_rtsp_host}:{self.processed_rtsp_port}/processed/{safe_id}"
+
+    def processed_publish_url(self, drone_id: str) -> str:
+        safe_id = quote(str(drone_id).strip(), safe="")
+
+        if self.processed_publish_transport == "whip":
+            template = self.processed_whip_url_template or "http://127.0.0.1:8889/processed/{droneId}/whip"
+            return template.replace("{droneId}", safe_id).replace("{streamKey}", safe_id)
+
+        return self.processed_stream_url(drone_id)
 
 
 def ensure_directories(settings: ServiceSettings) -> None:
@@ -131,6 +142,15 @@ def load_settings() -> ServiceSettings:
         processed_rtsp_url_template=os.environ.get(
             "PYRONE_PROCESSED_RTSP_URL_TEMPLATE",
             "",
+        ).strip(),
+        processed_publish_transport=(
+            "rtsp"
+            if os.environ.get("PYRONE_PROCESSED_PUBLISH_TRANSPORT", "whip").strip().lower() == "rtsp"
+            else "whip"
+        ),
+        processed_whip_url_template=os.environ.get(
+            "PYRONE_PROCESSED_WHIP_URL_TEMPLATE",
+            "http://127.0.0.1:8889/processed/{droneId}/whip",
         ).strip(),
         processed_rtsp_enabled=_read_bool("PYRONE_PROCESSED_RTSP_ENABLED", True),
         processed_rtsp_bitrate=os.environ.get("PYRONE_PROCESSED_RTSP_BITRATE", "2500k").strip()

@@ -292,7 +292,7 @@ class PipelineManager:
 
     def _cleanup_orphaned_publishers(self) -> None:
         active_output_urls = {
-            self.settings.processed_stream_url(str(pipeline["droneId"]))
+            self.settings.processed_publish_url(str(pipeline["droneId"]))
             for pipeline in self._pipelines.values()
             if pipeline.get("analyticsEnabled")
         }
