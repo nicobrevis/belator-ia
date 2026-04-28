@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler
 import json
 from pathlib import Path
 import re
+import subprocess
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -183,7 +184,8 @@ class AnalyticsServiceApp:
             file_path = Path(str(entry.get("filePath") or "")).expanduser().resolve()
             if not file_path.exists() or not file_path.is_file():
                 return self._send_json(handler, {"error": f"recording file not found: {file_path}"}, status=404)
-            return self._send_file(handler, file_path, range_header=handler.headers.get("Range", ""))
+            media_path = self._browser_media_path(file_path)
+            return self._send_file(handler, media_path, range_header=handler.headers.get("Range", ""))
 
         self._send_json(handler, {"error": "not found"}, status=404)
 
@@ -278,6 +280,97 @@ class AnalyticsServiceApp:
         if suffix == ".png":
             return "image/png"
         return "application/octet-stream"
+
+    def _browser_media_path(self, file_path: Path) -> Path:
+        if file_path.suffix.lower() != ".mp4" or file_path.name.endswith(".browser.mp4"):
+            return file_path
+
+        sidecar_path = file_path.with_name(f"{file_path.stem}.browser.mp4")
+        if self._is_fresh_media(sidecar_path, file_path):
+            return sidecar_path
+
+        if self._is_browser_playable_mp4(file_path):
+            return file_path
+
+        if self._transcode_browser_mp4(file_path, sidecar_path):
+            return sidecar_path
+
+        return file_path
+
+    @staticmethod
+    def _is_fresh_media(candidate: Path, source: Path) -> bool:
+        try:
+            return (
+                candidate.exists()
+                and candidate.is_file()
+                and candidate.stat().st_size > 0
+                and candidate.stat().st_mtime >= source.stat().st_mtime
+            )
+        except OSError:
+            return False
+
+    def _is_browser_playable_mp4(self, file_path: Path) -> bool:
+        try:
+            result = subprocess.run(
+                [
+                    self.settings.ffmpeg_path,
+                    "-hide_banner",
+                    "-i",
+                    str(file_path),
+                ],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+            )
+        except Exception:
+            return False
+
+        details = result.stderr.lower()
+        return "video: h264" in details or "video: avc1" in details
+
+    def _transcode_browser_mp4(self, source_path: Path, output_path: Path) -> bool:
+        tmp_path = output_path.with_name(f"{output_path.stem}.tmp.mp4")
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            subprocess.run(
+                [
+                    self.settings.ffmpeg_path,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "veryfast",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-profile:v",
+                    "baseline",
+                    "-movflags",
+                    "+faststart",
+                    str(tmp_path),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=180,
+            )
+            tmp_path.replace(output_path)
+            return output_path.exists() and output_path.stat().st_size > 0
+        except Exception:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            return False
 
     def _latest_frame_for_variant(self, drone_id: str, *, variant: str) -> bytes | None:
         if variant == "raw":
