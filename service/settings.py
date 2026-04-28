@@ -49,10 +49,12 @@ class ServiceSettings:
     snapshots_dir: Path
     processed_rtsp_host: str
     processed_rtsp_port: int
+    processed_rtsp_url_template: str
     processed_rtsp_enabled: bool
     processed_rtsp_bitrate: str
     processed_rtsp_bufsize: str
     processed_rtsp_preset: str
+    processed_rtsp_write_timeout_seconds: float
     storage_high_watermark: float
     storage_low_watermark: float
     ffmpeg_path: str
@@ -72,6 +74,12 @@ class ServiceSettings:
 
     def processed_stream_url(self, drone_id: str) -> str:
         safe_id = quote(str(drone_id).strip(), safe="")
+        if self.processed_rtsp_url_template:
+            return self.processed_rtsp_url_template.replace("{droneId}", safe_id).replace(
+                "{streamKey}",
+                safe_id,
+            )
+
         return f"rtsp://{self.processed_rtsp_host}:{self.processed_rtsp_port}/processed/{safe_id}"
 
 
@@ -120,6 +128,10 @@ def load_settings() -> ServiceSettings:
         processed_rtsp_host=os.environ.get("PYRONE_PROCESSED_RTSP_HOST", "127.0.0.1").strip()
         or "127.0.0.1",
         processed_rtsp_port=_read_int("PYRONE_PROCESSED_RTSP_PORT", 8554),
+        processed_rtsp_url_template=os.environ.get(
+            "PYRONE_PROCESSED_RTSP_URL_TEMPLATE",
+            "",
+        ).strip(),
         processed_rtsp_enabled=_read_bool("PYRONE_PROCESSED_RTSP_ENABLED", True),
         processed_rtsp_bitrate=os.environ.get("PYRONE_PROCESSED_RTSP_BITRATE", "2500k").strip()
         or "2500k",
@@ -127,6 +139,10 @@ def load_settings() -> ServiceSettings:
         or "5000k",
         processed_rtsp_preset=os.environ.get("PYRONE_PROCESSED_RTSP_PRESET", "veryfast").strip()
         or "veryfast",
+        processed_rtsp_write_timeout_seconds=max(
+            1.0,
+            _read_float("PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS", 3.0),
+        ),
         storage_high_watermark=storage_high_watermark,
         storage_low_watermark=storage_low_watermark,
         ffmpeg_path=os.environ.get("PYRONE_IA_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 import hashlib
+import queue
 import select
 import threading
 import time
@@ -167,12 +168,21 @@ class _RtspFramePublisher:
         bitrate: str,
         bufsize: str,
         preset: str,
+        write_timeout_seconds: float,
     ) -> None:
         self.output_url = output_url
         self.width = int(width)
         self.height = int(height)
         self.fps = max(float(fps or 1.0), 1.0)
+        self.write_timeout_seconds = max(1.0, float(write_timeout_seconds or 3.0))
         self._process: subprocess.Popen[bytes] | None = None
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=1)
+        self._stop_event = threading.Event()
+        self._lock = threading.Lock()
+        self._failed = False
+        self._last_error = ""
+        self._write_started_at = 0.0
+        self._thread: threading.Thread | None = None
         gop = max(2, int(round(self.fps * 2)))
         self._command = [
             ffmpeg_path,
@@ -227,13 +237,33 @@ class _RtspFramePublisher:
             stderr=subprocess.DEVNULL,
             bufsize=0,
         )
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"pyrone-rtsp-publisher-{self._process.pid}",
+            daemon=True,
+        )
+        self._thread.start()
 
     @property
     def pid(self) -> int | None:
         return self._process.pid if self._process else None
 
     def is_running(self) -> bool:
-        return bool(self._process and self._process.stdin and self._process.poll() is None)
+        process = self._process
+        if not process or not process.stdin or process.poll() is not None:
+            return False
+
+        with self._lock:
+            if self._failed:
+                return False
+
+            write_started_at = self._write_started_at
+
+        if write_started_at and time.monotonic() - write_started_at > self.write_timeout_seconds:
+            self.release()
+            return False
+
+        return True
 
     def write(self, frame) -> bool:
         if not self.is_running() or not self._process or not self._process.stdin:
@@ -242,15 +272,57 @@ class _RtspFramePublisher:
             return False
 
         try:
-            self._process.stdin.write(np.ascontiguousarray(frame).tobytes())
+            payload = np.ascontiguousarray(frame).tobytes()
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._queue.put_nowait(payload)
             return True
-        except (BrokenPipeError, OSError, ValueError):
+        except (BrokenPipeError, OSError, ValueError, queue.Full):
             self.release()
             return False
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                payload = self._queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            process = self._process
+            if not process or not process.stdin or process.poll() is not None:
+                self._mark_failed("processed stream process stopped")
+                return
+
+            try:
+                with self._lock:
+                    self._write_started_at = time.monotonic()
+                process.stdin.write(payload)
+            except (BrokenPipeError, OSError, ValueError) as error:
+                self._mark_failed(str(error))
+                return
+            finally:
+                with self._lock:
+                    self._write_started_at = 0.0
+
+    def _mark_failed(self, error: str) -> None:
+        with self._lock:
+            self._failed = True
+            self._last_error = error
 
     def release(self) -> None:
         process = self._process
         self._process = None
+        self._stop_event.set()
+
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
         if not process:
             return
         try:
@@ -265,6 +337,10 @@ class _RtspFramePublisher:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=3)
+        finally:
+            thread = self._thread
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=1.0)
 
 
 class DroneWorker:
@@ -759,6 +835,7 @@ class DroneWorker:
                     bitrate=self.settings.processed_rtsp_bitrate,
                     bufsize=self.settings.processed_rtsp_bufsize,
                     preset=self.settings.processed_rtsp_preset,
+                    write_timeout_seconds=self.settings.processed_rtsp_write_timeout_seconds,
                 )
                 self._processed_publisher_signature = signature
             except Exception as error:
