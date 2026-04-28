@@ -265,6 +265,7 @@ class DroneWorker:
         self._latest_raw_frame_jpeg: bytes | None = None
         self._processed_publisher: _RtspFramePublisher | None = None
         self._processed_publisher_signature: tuple[str, int, int, int] | None = None
+        self._active_capture = None
         self._runtime = {
             "status": "configured",
             "message": "",
@@ -329,6 +330,7 @@ class DroneWorker:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
+        self._release_active_capture()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
         recording = self._recorder.close()
@@ -435,6 +437,7 @@ class DroneWorker:
                 continue
 
             source_fps = self._capture_fps(capture)
+            self._set_active_capture(capture)
             self._mark_source_open(
                 source=source,
                 source_type="rtsp" if source.strip().lower().startswith("rtsp://") else "video",
@@ -444,37 +447,39 @@ class DroneWorker:
             )
             last_processed_at = 0.0
 
-            while not self._stop_event.is_set():
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    self._stop_processed_publisher()
-                    self._clear_preview()
-                    self._set_runtime(
-                        status="waiting_source",
-                        message="source frame read failed",
-                        sourceOpened=False,
-                        activeRtspConnections=0,
-                        singleIngestHealthy=True,
-                        lastSourceError="source frame read failed",
+            try:
+                while not self._stop_event.is_set():
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        self._stop_processed_publisher()
+                        self._clear_preview()
+                        self._set_runtime(
+                            status="waiting_source",
+                            message="source frame read failed",
+                            sourceOpened=False,
+                            activeRtspConnections=0,
+                            singleIngestHealthy=True,
+                            lastSourceError="source frame read failed",
+                        )
+                        break
+
+                    now = time.monotonic()
+                    if last_processed_at and now - last_processed_at < min_frame_interval:
+                        continue
+                    last_processed_at = now
+
+                    pipeline = self._pipeline_snapshot()
+                    if not pipeline.get("analyticsEnabled", True):
+                        break
+                    min_frame_interval = 1.0 / max(
+                        0.5,
+                        float(pipeline.get("processingFps") or self.settings.processing_fps),
                     )
-                    break
 
-                now = time.monotonic()
-                if last_processed_at and now - last_processed_at < min_frame_interval:
-                    continue
-                last_processed_at = now
-
-                pipeline = self._pipeline_snapshot()
-                if not pipeline.get("analyticsEnabled", True):
-                    break
-                min_frame_interval = 1.0 / max(
-                    0.5,
-                    float(pipeline.get("processingFps") or self.settings.processing_fps),
-                )
-
-                self._process_frame(frame, source_fps=source_fps, pipeline=pipeline)
-
-            capture.release()
+                    self._process_frame(frame, source_fps=source_fps, pipeline=pipeline)
+            finally:
+                self._clear_active_capture(capture)
+                capture.release()
             self._mark_source_closed(last_error="")
             if not self._stop_event.is_set():
                 time.sleep(self.settings.reconnect_delay_seconds)
@@ -838,6 +843,22 @@ class DroneWorker:
     def _pipeline_snapshot(self) -> dict[str, object]:
         with self._lock:
             return dict(self._pipeline)
+
+    def _set_active_capture(self, capture) -> None:
+        with self._lock:
+            self._active_capture = capture
+
+    def _clear_active_capture(self, capture) -> None:
+        with self._lock:
+            if self._active_capture is capture:
+                self._active_capture = None
+
+    def _release_active_capture(self) -> None:
+        with self._lock:
+            capture = self._active_capture
+            self._active_capture = None
+        if capture:
+            capture.release()
 
     def _set_runtime(self, **updates) -> None:
         with self._lock:
