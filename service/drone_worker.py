@@ -703,6 +703,8 @@ class DroneWorker:
             "processedStreamReady": False,
             "processedStreamUrl": self.settings.processed_stream_url(str(pipeline.get("droneId") or "")),
             "processedPublisherPid": None,
+            "processedStreamRevision": 0,
+            "processedStreamStartedAt": "",
             "device": self._resolve_device(),
         }
         self._model_id = ""
@@ -1112,6 +1114,16 @@ class DroneWorker:
             processedStreamUrl=self._processed_publish_url(),
         )
 
+    def _mark_processed_publisher_started(self) -> None:
+        with self._lock:
+            revision = int(self._runtime.get("processedStreamRevision") or 0) + 1
+            self._runtime.update(
+                {
+                    "processedStreamRevision": revision,
+                    "processedStreamStartedAt": utc_now(),
+                }
+            )
+
     def _publish_processed_frame(self, frame, *, fps: float) -> None:
         if not self.settings.processed_rtsp_enabled:
             self._stop_processed_publisher()
@@ -1152,6 +1164,7 @@ class DroneWorker:
                         write_timeout_seconds=self.settings.processed_rtsp_write_timeout_seconds,
                     )
                 self._processed_publisher_signature = signature
+                self._mark_processed_publisher_started()
             except Exception as error:
                 self._set_runtime(
                     processedStreamReady=False,

@@ -234,6 +234,8 @@ class PipelineManager:
                 "processedStreamReady": False,
                 "processedStreamUrl": str(pipeline.get("processedRtspUrl") or ""),
                 "processedPublisherPid": None,
+                "processedStreamRevision": 0,
+                "processedStreamStartedAt": "",
                 "currentEvent": None,
                 "lastRecording": None,
             }
