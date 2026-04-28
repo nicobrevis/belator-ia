@@ -185,8 +185,7 @@ class _FfmpegMjpegReader:
                 if end_index != -1:
                     jpeg_bytes = bytes(self._buffer[start_index : end_index + 2])
                     del self._buffer[: end_index + 2]
-                    if self._is_stale_duplicate_frame(jpeg_bytes):
-                        return False, None
+                    self._track_duplicate_frame(jpeg_bytes)
                     frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                     return (frame is not None), frame
 
@@ -210,7 +209,7 @@ class _FfmpegMjpegReader:
             if len(self._buffer) > 8 * 1024 * 1024:
                 del self._buffer[: 4 * 1024 * 1024]
 
-    def _is_stale_duplicate_frame(self, jpeg_bytes: bytes) -> bool:
+    def _track_duplicate_frame(self, jpeg_bytes: bytes) -> None:
         digest = hashlib.blake2s(jpeg_bytes, digest_size=8).digest()
         now = time.monotonic()
 
@@ -218,13 +217,9 @@ class _FfmpegMjpegReader:
             self._last_frame_digest = digest
             self._last_unique_frame_at = now
             self._duplicate_frame_count = 0
-            return False
+            return
 
         self._duplicate_frame_count += 1
-        return (
-            self._duplicate_frame_count >= self._stale_frame_count
-            and now - self._last_unique_frame_at >= self._stale_frame_timeout_seconds
-        )
 
     def release(self) -> None:
         process = self._process

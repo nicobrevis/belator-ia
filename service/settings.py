@@ -149,7 +149,7 @@ def load_settings() -> ServiceSettings:
         inference_device=os.environ.get("PYRONE_INFERENCE_DEVICE", "auto").strip() or "auto",
         inference_confidence=min(max(_read_float("PYRONE_INFERENCE_CONFIDENCE", 0.15), 0.01), 0.99),
         inference_image_size=max(320, _read_int("PYRONE_INFERENCE_IMAGE_SIZE", 960)),
-        processing_fps=max(0.5, _read_float("PYRONE_PROCESSING_FPS", 4.0)),
+        processing_fps=max(0.5, _read_float("PYRONE_PROCESSING_FPS", 20.0)),
         rtsp_read_timeout_seconds=max(0.5, _read_float("PYRONE_RTSP_READ_TIMEOUT_SECONDS", 5.0)),
         reconnect_delay_seconds=max(0.5, _read_float("PYRONE_RECONNECT_DELAY_SECONDS", 2.0)),
         pre_event_seconds=max(0.0, _read_float("PYRONE_PRE_EVENT_SECONDS", 10.0)),
