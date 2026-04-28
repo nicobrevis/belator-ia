@@ -131,6 +131,116 @@ class _FfmpegMjpegReader:
                 process.stdout.close()
 
 
+class _RtspFramePublisher:
+    def __init__(
+        self,
+        *,
+        ffmpeg_path: str,
+        output_url: str,
+        width: int,
+        height: int,
+        fps: float,
+        bitrate: str,
+        bufsize: str,
+        preset: str,
+    ) -> None:
+        self.output_url = output_url
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(float(fps or 1.0), 1.0)
+        self._process: subprocess.Popen[bytes] | None = None
+        gop = max(2, int(round(self.fps * 2)))
+        self._command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            f"{self.fps:.2f}",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-tune",
+            "zerolatency",
+            "-pix_fmt",
+            "yuv420p",
+            "-profile:v",
+            "baseline",
+            "-g",
+            str(gop),
+            "-keyint_min",
+            str(gop),
+            "-sc_threshold",
+            "0",
+            "-b:v",
+            bitrate,
+            "-maxrate",
+            bitrate,
+            "-bufsize",
+            bufsize,
+            "-f",
+            "rtsp",
+            "-rtsp_transport",
+            "tcp",
+            output_url,
+        ]
+        self._process = subprocess.Popen(
+            self._command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+        )
+
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process else None
+
+    def is_running(self) -> bool:
+        return bool(self._process and self._process.stdin and self._process.poll() is None)
+
+    def write(self, frame) -> bool:
+        if not self.is_running() or not self._process or not self._process.stdin:
+            return False
+        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+            return False
+
+        try:
+            self._process.stdin.write(np.ascontiguousarray(frame).tobytes())
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            self.release()
+            return False
+
+    def release(self) -> None:
+        process = self._process
+        self._process = None
+        if not process:
+            return
+        try:
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
 class DroneWorker:
     def __init__(
         self,
@@ -151,6 +261,8 @@ class DroneWorker:
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
+        self._processed_publisher: _RtspFramePublisher | None = None
+        self._processed_publisher_signature: tuple[str, int, int, int] | None = None
         self._runtime = {
             "status": "configured",
             "message": "",
@@ -185,6 +297,9 @@ class DroneWorker:
             "latestProcessedFrameContentType": "image/jpeg",
             "latestRawFrameAvailable": False,
             "latestRawFrameContentType": "image/jpeg",
+            "processedStreamReady": False,
+            "processedStreamUrl": self.settings.processed_stream_url(str(pipeline.get("droneId") or "")),
+            "processedPublisherPid": None,
             "device": self._resolve_device(),
         }
         self._model_id = ""
@@ -217,6 +332,7 @@ class DroneWorker:
         recording = self._recorder.close()
         if recording:
             self._store_recording(recording)
+        self._stop_processed_publisher()
         self._clear_preview()
         self._set_runtime(status="stopped", message="worker stopped", sourceOpened=False, currentEvent=None)
 
@@ -257,6 +373,7 @@ class DroneWorker:
                 float(pipeline.get("processingFps") or self.settings.processing_fps),
             )
             if not pipeline.get("analyticsEnabled", True):
+                self._stop_processed_publisher()
                 self._clear_preview()
                 self._set_runtime(
                     status="disabled",
@@ -270,6 +387,7 @@ class DroneWorker:
 
             source = str(pipeline.get("rtspUrl") or "").strip()
             if not source:
+                self._stop_processed_publisher()
                 self._clear_preview()
                 self._set_runtime(
                     status="waiting_source",
@@ -300,6 +418,7 @@ class DroneWorker:
 
             capture = self._open_capture(source)
             if not capture.isOpened():
+                self._stop_processed_publisher()
                 self._clear_preview()
                 self._set_runtime(
                     status="waiting_source",
@@ -326,6 +445,7 @@ class DroneWorker:
             while not self._stop_event.is_set():
                 ok, frame = capture.read()
                 if not ok or frame is None:
+                    self._stop_processed_publisher()
                     self._clear_preview()
                     self._set_runtime(
                         status="waiting_source",
@@ -450,6 +570,7 @@ class DroneWorker:
 
         model_info = self._ensure_model(pipeline)
         if not model_info:
+            self._stop_processed_publisher()
             self._clear_processed_preview()
             time.sleep(self.settings.reconnect_delay_seconds)
             return
@@ -504,6 +625,7 @@ class DroneWorker:
                 self._store_recording(recording)
 
         self._update_preview(annotated)
+        self._publish_processed_frame(annotated, fps=effective_fps)
         self._update_runtime_after_frame(
             frame_width=frame_width,
             frame_height=frame_height,
@@ -565,13 +687,77 @@ class DroneWorker:
             self._runtime["latestProcessedFrameAvailable"] = processed_available
             self._runtime["latestProcessedFrameContentType"] = "image/jpeg"
 
+    def _processed_stream_url(self) -> str:
+        return self.settings.processed_stream_url(self.pipeline_id)
+
+    def _stop_processed_publisher(self) -> None:
+        publisher = self._processed_publisher
+        self._processed_publisher = None
+        self._processed_publisher_signature = None
+        if publisher:
+            publisher.release()
+        self._set_runtime(
+            processedStreamReady=False,
+            processedPublisherPid=None,
+            processedStreamUrl=self._processed_stream_url(),
+        )
+
+    def _publish_processed_frame(self, frame, *, fps: float) -> None:
+        if not self.settings.processed_rtsp_enabled:
+            self._stop_processed_publisher()
+            return
+
+        frame_height, frame_width = frame.shape[:2]
+        rounded_fps = max(1, int(round(float(fps or self.settings.processing_fps))))
+        output_url = self._processed_stream_url()
+        signature = (output_url, frame_width, frame_height, rounded_fps)
+
+        if (
+            self._processed_publisher_signature != signature
+            or not self._processed_publisher
+            or not self._processed_publisher.is_running()
+        ):
+            self._stop_processed_publisher()
+            try:
+                self._processed_publisher = _RtspFramePublisher(
+                    ffmpeg_path=self.settings.ffmpeg_path,
+                    output_url=output_url,
+                    width=frame_width,
+                    height=frame_height,
+                    fps=float(rounded_fps),
+                    bitrate=self.settings.processed_rtsp_bitrate,
+                    bufsize=self.settings.processed_rtsp_bufsize,
+                    preset=self.settings.processed_rtsp_preset,
+                )
+                self._processed_publisher_signature = signature
+            except Exception as error:
+                self._set_runtime(
+                    processedStreamReady=False,
+                    processedPublisherPid=None,
+                    lastSourceError=f"processed stream publisher failed: {error}",
+                )
+                return
+
+        if not self._processed_publisher.write(frame):
+            self._stop_processed_publisher()
+            self._set_runtime(lastSourceError="processed stream publisher stopped")
+            return
+
+        self._set_runtime(
+            processedStreamReady=True,
+            processedStreamUrl=output_url,
+            processedPublisherPid=self._processed_publisher.pid,
+        )
+
     def _clear_processed_preview(self) -> None:
+        self._stop_processed_publisher()
         with self._lock:
             self._latest_processed_frame_jpeg = None
             self._runtime["latestFrameAvailable"] = False
             self._runtime["latestProcessedFrameAvailable"] = False
 
     def _clear_preview(self) -> None:
+        self._stop_processed_publisher()
         with self._lock:
             self._latest_processed_frame_jpeg = None
             self._latest_raw_frame_jpeg = None

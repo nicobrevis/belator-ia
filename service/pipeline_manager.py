@@ -180,7 +180,9 @@ class PipelineManager:
         }
         worker = self._workers.get(str(pipeline["droneId"]))
         if worker:
-            public["runtime"] = worker.runtime_snapshot()
+            runtime = worker.runtime_snapshot()
+            public["runtime"] = runtime
+            public["processedStreamReady"] = bool(runtime.get("processedStreamReady"))
         else:
             public["runtime"] = {
                 "status": "disabled" if not pipeline["analyticsEnabled"] else "configured",
@@ -202,6 +204,9 @@ class PipelineManager:
                 "latestFrameAvailable": False,
                 "latestProcessedFrameAvailable": False,
                 "latestRawFrameAvailable": False,
+                "processedStreamReady": False,
+                "processedStreamUrl": str(pipeline.get("processedRtspUrl") or ""),
+                "processedPublisherPid": None,
                 "currentEvent": None,
                 "lastRecording": None,
             }

@@ -26,6 +26,13 @@ def _read_float(name: str, fallback: float) -> float:
         return fallback
 
 
+def _read_bool(name: str, fallback: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return fallback
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class ServiceSettings:
     repo_dir: Path
@@ -42,6 +49,10 @@ class ServiceSettings:
     snapshots_dir: Path
     processed_rtsp_host: str
     processed_rtsp_port: int
+    processed_rtsp_enabled: bool
+    processed_rtsp_bitrate: str
+    processed_rtsp_bufsize: str
+    processed_rtsp_preset: str
     storage_high_watermark: float
     storage_low_watermark: float
     ffmpeg_path: str
@@ -108,7 +119,14 @@ def load_settings() -> ServiceSettings:
         snapshots_dir=nvr_mount_dir / "snapshots",
         processed_rtsp_host=os.environ.get("PYRONE_PROCESSED_RTSP_HOST", "127.0.0.1").strip()
         or "127.0.0.1",
-        processed_rtsp_port=_read_int("PYRONE_PROCESSED_RTSP_PORT", 9554),
+        processed_rtsp_port=_read_int("PYRONE_PROCESSED_RTSP_PORT", 8554),
+        processed_rtsp_enabled=_read_bool("PYRONE_PROCESSED_RTSP_ENABLED", True),
+        processed_rtsp_bitrate=os.environ.get("PYRONE_PROCESSED_RTSP_BITRATE", "2500k").strip()
+        or "2500k",
+        processed_rtsp_bufsize=os.environ.get("PYRONE_PROCESSED_RTSP_BUFSIZE", "5000k").strip()
+        or "5000k",
+        processed_rtsp_preset=os.environ.get("PYRONE_PROCESSED_RTSP_PRESET", "veryfast").strip()
+        or "veryfast",
         storage_high_watermark=storage_high_watermark,
         storage_low_watermark=storage_low_watermark,
         ffmpeg_path=os.environ.get("PYRONE_IA_FFMPEG_PATH", "ffmpeg").strip() or "ffmpeg",
