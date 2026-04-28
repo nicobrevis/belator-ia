@@ -166,6 +166,8 @@ class _RtspFramePublisher:
             "-i",
             "pipe:0",
             "-an",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
             "-c:v",
             "libx264",
             "-preset",
