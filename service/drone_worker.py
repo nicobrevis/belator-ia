@@ -102,12 +102,19 @@ def _terminate_matching_ffmpeg_processes(
 
 def cleanup_orphaned_processed_publishers(active_output_urls: set[str]) -> None:
     for pid, command in _ffmpeg_processes():
-        output_url = next((part for part in command if "/processed/" in part and part.startswith("rtsp://")), "")
+        output_url = next(
+            (
+                part
+                for part in command
+                if "/processed/" in part and part.startswith(("rtsp://", "rtmp://"))
+            ),
+            "",
+        )
 
         if not output_url or output_url in active_output_urls:
             continue
 
-        if "rawvideo" not in command or "rtsp" not in command:
+        if "rawvideo" not in command or ("rtsp" not in command and "flv" not in command):
             continue
 
         _terminate_ffmpeg_process(pid)
@@ -242,12 +249,13 @@ class _FfmpegMjpegReader:
                 process.stdout.close()
 
 
-class _RtspFramePublisher:
+class _FfmpegFramePublisher:
     def __init__(
         self,
         *,
         ffmpeg_path: str,
         output_url: str,
+        transport: str,
         width: int,
         height: int,
         fps: float,
@@ -257,6 +265,7 @@ class _RtspFramePublisher:
         write_timeout_seconds: float,
     ) -> None:
         self.output_url = output_url
+        self.transport = "rtmp" if transport == "rtmp" else "rtsp"
         self.width = int(width)
         self.height = int(height)
         self.fps = max(float(fps or 1.0), 1.0)
@@ -269,11 +278,17 @@ class _RtspFramePublisher:
         self._last_error = ""
         self._write_started_at = 0.0
         self._thread: threading.Thread | None = None
+        required_tokens = ("rawvideo", "flv") if self.transport == "rtmp" else ("rawvideo", "rtsp")
         _terminate_matching_ffmpeg_processes(
             output_url,
-            required_tokens=("rawvideo", "rtsp"),
+            required_tokens=required_tokens,
         )
-        gop = max(2, int(round(self.fps * 2)))
+        gop = max(2, int(round(self.fps)))
+        output_args = (
+            ["-f", "flv", "-flvflags", "no_duration_filesize", output_url]
+            if self.transport == "rtmp"
+            else ["-f", "rtsp", "-rtsp_transport", "tcp", output_url]
+        )
         self._command = [
             ffmpeg_path,
             "-hide_banner",
@@ -302,23 +317,23 @@ class _RtspFramePublisher:
             "yuv420p",
             "-profile:v",
             "baseline",
+            "-bf",
+            "0",
             "-g",
             str(gop),
             "-keyint_min",
             str(gop),
             "-sc_threshold",
             "0",
+            "-x264-params",
+            f"keyint={gop}:min-keyint={gop}:scenecut=0:repeat-headers=1",
             "-b:v",
             bitrate,
             "-maxrate",
             bitrate,
             "-bufsize",
             bufsize,
-            "-f",
-            "rtsp",
-            "-rtsp_transport",
-            "tcp",
-            output_url,
+            *output_args,
         ]
         self._process = subprocess.Popen(
             self._command,
@@ -329,7 +344,7 @@ class _RtspFramePublisher:
         )
         self._thread = threading.Thread(
             target=self._run,
-            name=f"pyrone-rtsp-publisher-{self._process.pid}",
+            name=f"pyrone-{self.transport}-publisher-{self._process.pid}",
             daemon=True,
         )
         self._thread.start()
@@ -663,7 +678,7 @@ class DroneWorker:
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
-        self._processed_publisher: _RtspFramePublisher | _WhipFramePublisher | None = None
+        self._processed_publisher: _FfmpegFramePublisher | _WhipFramePublisher | None = None
         self._processed_publisher_signature: tuple[str, str, int, int, int] | None = None
         self._active_capture = None
         self._runtime = {
@@ -1152,9 +1167,10 @@ class DroneWorker:
                         startup_timeout_seconds=self.settings.rtsp_read_timeout_seconds,
                     )
                 else:
-                    self._processed_publisher = _RtspFramePublisher(
+                    self._processed_publisher = _FfmpegFramePublisher(
                         ffmpeg_path=self.settings.ffmpeg_path,
                         output_url=output_url,
+                        transport=transport,
                         width=frame_width,
                         height=frame_height,
                         fps=float(rounded_fps),
