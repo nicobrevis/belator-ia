@@ -64,6 +64,12 @@ class ServiceSettings:
     inference_device: str
     inference_confidence: float
     inference_image_size: int
+    second_stage_enabled: bool
+    second_stage_model_path: Path
+    second_stage_conf_low: float
+    second_stage_conf_high: float
+    second_stage_crop_size: int
+    second_stage_image_size: int
     processing_fps: float
     rtsp_read_timeout_seconds: float
     reconnect_delay_seconds: float
@@ -72,8 +78,12 @@ class ServiceSettings:
     event_cooldown_seconds: float
     event_min_positive_frames: int
     event_confirmation_window_frames: int
+    recording_segment_mode: str
+    recording_segment_minutes: int
+    recording_segment_max_mb: int
     preview_jpeg_quality: int
     max_frame_width: int
+    mjpeg_buffer_seconds: float
 
     def processed_stream_url(self, drone_id: str) -> str:
         safe_id = quote(str(drone_id).strip(), safe="")
@@ -182,6 +192,29 @@ def load_settings() -> ServiceSettings:
         inference_device=os.environ.get("PYRONE_INFERENCE_DEVICE", "auto").strip() or "auto",
         inference_confidence=min(max(_read_float("PYRONE_INFERENCE_CONFIDENCE", 0.15), 0.01), 0.99),
         inference_image_size=max(320, _read_int("PYRONE_INFERENCE_IMAGE_SIZE", 960)),
+        second_stage_enabled=_read_bool("PYRONE_SECOND_STAGE_ENABLED", True),
+        second_stage_model_path=Path(
+            os.environ.get(
+                "PYRONE_SECOND_STAGE_MODEL_PATH",
+                str(SERVICE_DIR / "models" / "ad_phash3_early_smoke_best.pt"),
+            )
+        ).expanduser().resolve(),
+        second_stage_conf_low=min(
+            max(_read_float("PYRONE_SECOND_STAGE_CONF_LOW", 0.10), 0.0),
+            0.99,
+        ),
+        second_stage_conf_high=min(
+            max(_read_float("PYRONE_SECOND_STAGE_CONF_HIGH", 0.30), 0.01),
+            1.0,
+        ),
+        second_stage_crop_size=min(
+            max(_read_int("PYRONE_SECOND_STAGE_CROP_SIZE", 224), 64),
+            1024,
+        ),
+        second_stage_image_size=min(
+            max(_read_int("PYRONE_SECOND_STAGE_IMAGE_SIZE", 224), 64),
+            1024,
+        ),
         processing_fps=max(0.5, _read_float("PYRONE_PROCESSING_FPS", 20.0)),
         rtsp_read_timeout_seconds=max(0.5, _read_float("PYRONE_RTSP_READ_TIMEOUT_SECONDS", 5.0)),
         reconnect_delay_seconds=max(0.5, _read_float("PYRONE_RECONNECT_DELAY_SECONDS", 2.0)),
@@ -193,8 +226,25 @@ def load_settings() -> ServiceSettings:
             1,
             _read_int("PYRONE_EVENT_CONFIRMATION_WINDOW_FRAMES", 6),
         ),
+        recording_segment_mode=(
+            "size"
+            if os.environ.get("PYRONE_RECORDING_SEGMENT_MODE", "time").strip().lower() == "size"
+            else "time"
+        ),
+        recording_segment_minutes=min(
+            max(_read_int("PYRONE_RECORDING_SEGMENT_MINUTES", 5), 1),
+            120,
+        ),
+        recording_segment_max_mb=min(
+            max(_read_int("PYRONE_RECORDING_SEGMENT_MAX_MB", 200), 20),
+            4096,
+        ),
         preview_jpeg_quality=min(max(_read_int("PYRONE_PREVIEW_JPEG_QUALITY", 80), 30), 100),
         max_frame_width=max(320, _read_int("PYRONE_MAX_FRAME_WIDTH", 1280)),
+        mjpeg_buffer_seconds=min(
+            max(_read_float("PYRONE_MJPEG_BUFFER_SECONDS", 1.0), 0.0),
+            10.0,
+        ),
     )
     ensure_directories(settings)
     return settings

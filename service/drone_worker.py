@@ -21,6 +21,7 @@ from service.model_registry import ModelRegistry
 from service.nvr_store import NvrStore
 from service.recorder import EventRecorder
 from service.schemas import utc_now
+from service.second_stage_classifier import SecondStageClassifier, SecondStageSummary
 from service.settings import ServiceSettings
 
 
@@ -154,6 +155,8 @@ class _FfmpegMjpegReader:
             "-i",
             source,
             "-an",
+            "-fps_mode",
+            "passthrough",
             "-f",
             "image2pipe",
             "-vcodec",
@@ -264,7 +267,11 @@ class DroneWorker:
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
+        self._model_id = ""
+        self._model_name = ""
+        self._latest_detections: dict[str, object] = self._empty_detections()
         self._active_capture = None
+        resolved_device = self._resolve_device()
         self._runtime = {
             "status": "configured",
             "message": "",
@@ -304,11 +311,23 @@ class DroneWorker:
             "processedPublisherPid": None,
             "processedStreamRevision": 0,
             "processedStreamStartedAt": "",
-            "device": self._resolve_device(),
+            "device": resolved_device,
+            "secondStageEnabled": self.settings.second_stage_enabled,
+            "secondStageApplied": False,
+            "secondStageAvailable": self.settings.second_stage_model_path.exists(),
+            "secondStageModelPath": str(self.settings.second_stage_model_path),
+            "secondStageConfLow": self.settings.second_stage_conf_low,
+            "secondStageConfHigh": self.settings.second_stage_conf_high,
+            "secondStageCropSize": self.settings.second_stage_crop_size,
+            "secondStageSentToClassifier": 0,
+            "secondStageRejectedByClassifier": 0,
+            "secondStageDroppedLow": 0,
+            "secondStageKeptAfterClassifier": 0,
+            "secondStageLastMs": 0.0,
+            "secondStageLastReason": "",
         }
-        self._model_id = ""
-        self._model_name = ""
         self._model: YOLO | None = None
+        self._second_stage = SecondStageClassifier(settings=self.settings, device=str(resolved_device))
         self._detector = EventDetector(
             min_positive_frames=self.settings.event_min_positive_frames,
             confirmation_window_frames=self.settings.event_confirmation_window_frames,
@@ -355,6 +374,17 @@ class DroneWorker:
     def latest_raw_frame(self) -> bytes | None:
         with self._lock:
             return self._latest_raw_frame_jpeg
+
+    def latest_detections(self) -> dict[str, object]:
+        with self._lock:
+            return {
+                **self._latest_detections,
+                "items": [
+                    dict(item)
+                    for item in self._latest_detections.get("items", [])
+                    if isinstance(item, dict)
+                ],
+            }
 
     def runtime_snapshot(self) -> dict[str, object]:
         with self._lock:
@@ -575,6 +605,7 @@ class DroneWorker:
     def _process_frame(self, frame, *, source_fps: float, pipeline: dict[str, object]) -> None:
         frame = self._prepare_frame(frame)
         self._update_raw_preview(frame)
+        frame_at = utc_now()
 
         model_info = self._ensure_model(pipeline)
         if not model_info:
@@ -589,17 +620,77 @@ class DroneWorker:
 
         inference_started = perf_counter()
         confidence_threshold = float(pipeline.get("confidenceThreshold") or self.settings.inference_confidence)
-        result = self._model.predict(
-            source=frame,
-            conf=confidence_threshold,
-            imgsz=int(model_info.get("imageSize") or self.settings.inference_image_size),
-            device=self._runtime["device"],
-            verbose=False,
-        )[0]
+        detector_confidence_threshold = self._second_stage.detector_confidence_threshold(
+            confidence_threshold,
+            model_info=model_info,
+            pipeline=pipeline,
+        )
+        second_stage_summary = SecondStageSummary(
+            enabled=self.settings.second_stage_enabled,
+            applied=False,
+            available=self.settings.second_stage_model_path.exists(),
+            reason="no detections",
+        )
+        if self._uses_skyline_composite_preprocessor(model_info):
+            inference_result = self._predict_skyline_composite(
+                frame,
+                confidence_threshold=detector_confidence_threshold,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            result = None
+            detection_items = inference_result["items"]
+            detection_items, second_stage_summary = self._second_stage.refine_items(
+                frame,
+                detection_items,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            detection_count = len(detection_items)
+            max_confidence = max(
+                (float(item.get("confidence") or 0.0) for item in detection_items),
+                default=0.0,
+            )
+        else:
+            predict_options = {
+                "source": frame,
+                "conf": detector_confidence_threshold,
+                "imgsz": int(model_info.get("imageSize") or self.settings.inference_image_size),
+                "device": self._runtime["device"],
+                "verbose": False,
+            }
+            if model_info.get("iouThreshold"):
+                predict_options["iou"] = float(model_info["iouThreshold"])
+            result = self._model.predict(**predict_options)[0]
+            result, second_stage_summary = self._second_stage.refine_result(
+                frame,
+                result,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            detection_count = 0 if result.boxes is None else len(result.boxes)
+            max_confidence = max(result.boxes.conf.tolist()) if detection_count and result.boxes is not None else 0.0
+            detection_items = None
         inference_ms = (perf_counter() - inference_started) * 1000.0
 
-        detection_count = 0 if result.boxes is None else len(result.boxes)
-        max_confidence = max(result.boxes.conf.tolist()) if detection_count and result.boxes is not None else 0.0
+        if detection_items is not None:
+            structured_detections = self._build_structured_detections_from_items(
+                detection_items,
+                frame_at=frame_at,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+        else:
+            structured_detections = self._build_structured_detections(
+                result,
+                frame_at=frame_at,
+                frame_width=frame_width,
+                frame_height=frame_height,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
         positive = detection_count > 0
         event = self._detector.update(
             positive=positive,
@@ -607,7 +698,20 @@ class DroneWorker:
             max_confidence=max_confidence,
         )
 
-        annotated = result.plot() if detection_count else frame.copy()
+        if detection_items is not None:
+            annotated = frame.copy()
+            if detection_count:
+                self._draw_detection_items(
+                    annotated,
+                    detection_items,
+                    model_info=model_info,
+                    pipeline=pipeline,
+                )
+        elif detection_count:
+            self._apply_display_labels(result, model_info=model_info, pipeline=pipeline)
+            annotated = result.plot()
+        else:
+            annotated = frame.copy()
         self._overlay_status(
             annotated,
             model_name=str(model_info.get("name") or model_info.get("id") or ""),
@@ -626,14 +730,19 @@ class DroneWorker:
                     "eventType": "smoke_detection",
                     "modelId": pipeline["currentModelId"],
                     "sensorType": pipeline.get("sensorType", "unknown"),
+                    "recordingSegmentMode": pipeline.get("recordingSegmentMode"),
+                    "recordingSegmentMinutes": pipeline.get("recordingSegmentMinutes"),
+                    "recordingSegmentMaxMb": pipeline.get("recordingSegmentMaxMb"),
                 },
                 fps=effective_fps,
             )
             if recording:
                 self._store_recording(recording)
 
+        self._update_detections(structured_detections)
         self._update_preview(annotated)
         self._update_runtime_after_frame(
+            frame_at=frame_at,
             frame_width=frame_width,
             frame_height=frame_height,
             source_fps=source_fps,
@@ -641,7 +750,614 @@ class DroneWorker:
             detection_count=detection_count,
             max_confidence=max_confidence,
             event=event,
+            second_stage_summary=second_stage_summary,
         )
+
+    def _empty_detections(self) -> dict[str, object]:
+        return {
+            "droneId": self.pipeline_id,
+            "frameAt": "",
+            "modelId": self._model_id,
+            "modelName": self._model_name,
+            "sensorType": str(self._pipeline.get("sensorType") or "unknown"),
+            "frameWidth": None,
+            "frameHeight": None,
+            "items": [],
+        }
+
+    def _build_structured_detections(
+        self,
+        result,
+        *,
+        frame_at: str,
+        frame_width: int,
+        frame_height: int,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> dict[str, object]:
+        items: list[dict[str, object]] = []
+        boxes = getattr(result, "boxes", None)
+
+        if boxes is not None and len(boxes) > 0:
+            xyxy = boxes.xyxy.detach().cpu().tolist() if getattr(boxes, "xyxy", None) is not None else []
+            confidences = boxes.conf.detach().cpu().tolist() if getattr(boxes, "conf", None) is not None else []
+            classes = boxes.cls.detach().cpu().tolist() if getattr(boxes, "cls", None) is not None else []
+            names = getattr(result, "names", {}) or {}
+            mask_polygons = self._mask_polygons_for_result(result)
+
+            for index, bbox_values in enumerate(xyxy):
+                if len(bbox_values) < 4:
+                    continue
+
+                x1, y1, x2, y2 = [float(value) for value in bbox_values[:4]]
+                x1 = min(max(x1, 0.0), float(frame_width))
+                x2 = min(max(x2, 0.0), float(frame_width))
+                y1 = min(max(y1, 0.0), float(frame_height))
+                y2 = min(max(y2, 0.0), float(frame_height))
+                width = max(0.0, x2 - x1)
+                height = max(0.0, y2 - y1)
+
+                if width <= 0.0 or height <= 0.0:
+                    continue
+
+                class_index = int(classes[index]) if index < len(classes) else 0
+                class_name = self._display_class_name(
+                    str(names.get(class_index, class_index)),
+                    model_info=model_info,
+                    pipeline=pipeline,
+                )
+                confidence = float(confidences[index]) if index < len(confidences) else 0.0
+                target_pixel = self._target_pixel_for_detection(
+                    bbox=(x1, y1, x2, y2),
+                    polygon=mask_polygons[index] if index < len(mask_polygons) else [],
+                )
+
+                items.append(
+                    {
+                        "detectionId": self._detection_id(frame_at, index),
+                        "index": index,
+                        "classIndex": class_index,
+                        "className": class_name,
+                        "confidence": round(confidence, 6),
+                        "bbox": {
+                            "x": round(x1, 2),
+                            "y": round(y1, 2),
+                            "width": round(width, 2),
+                            "height": round(height, 2),
+                        },
+                        "targetPixel": target_pixel,
+                    }
+                )
+
+        return {
+            "droneId": self.pipeline_id,
+            "frameAt": frame_at,
+            "modelId": str(model_info.get("id") or self._model_id),
+            "modelName": str(model_info.get("name") or self._model_name),
+            "sensorType": str(pipeline.get("sensorType") or "unknown"),
+            "frameWidth": frame_width,
+            "frameHeight": frame_height,
+            "items": items,
+        }
+
+    def _build_structured_detections_from_items(
+        self,
+        items: list[dict[str, object]],
+        *,
+        frame_at: str,
+        frame_width: int,
+        frame_height: int,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> dict[str, object]:
+        structured_items: list[dict[str, object]] = []
+
+        for index, item in enumerate(items):
+            bbox = item.get("bbox")
+            if not isinstance(bbox, tuple) or len(bbox) < 4:
+                continue
+
+            x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+            x1 = min(max(x1, 0.0), float(frame_width))
+            x2 = min(max(x2, 0.0), float(frame_width))
+            y1 = min(max(y1, 0.0), float(frame_height))
+            y2 = min(max(y2, 0.0), float(frame_height))
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+
+            if width <= 0.0 or height <= 0.0:
+                continue
+
+            class_index = int(item.get("classIndex") or 0)
+            class_name = self._display_class_name(
+                str(item.get("className") or class_index),
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            confidence = float(item.get("confidence") or 0.0)
+            target_pixel = self._target_pixel_for_detection(bbox=(x1, y1, x2, y2), polygon=[])
+
+            structured_item = {
+                "detectionId": self._detection_id(frame_at, index),
+                "index": index,
+                "classIndex": class_index,
+                "className": class_name,
+                "confidence": round(confidence, 6),
+                "bbox": {
+                    "x": round(x1, 2),
+                    "y": round(y1, 2),
+                    "width": round(width, 2),
+                    "height": round(height, 2),
+                },
+                "targetPixel": target_pixel,
+            }
+            if item.get("sourceRegion"):
+                structured_item["sourceRegion"] = str(item["sourceRegion"])
+            structured_items.append(structured_item)
+
+        return {
+            "droneId": self.pipeline_id,
+            "frameAt": frame_at,
+            "modelId": str(model_info.get("id") or self._model_id),
+            "modelName": str(model_info.get("name") or self._model_name),
+            "sensorType": str(pipeline.get("sensorType") or "unknown"),
+            "frameWidth": frame_width,
+            "frameHeight": frame_height,
+            "preprocessor": str(model_info.get("preprocessor") or "none"),
+            "items": structured_items,
+        }
+
+    @staticmethod
+    def _uses_skyline_composite_preprocessor(model_info: dict[str, object]) -> bool:
+        return str(model_info.get("preprocessor") or "").strip().lower() == "skyline_composite"
+
+    def _predict_skyline_composite(
+        self,
+        frame,
+        *,
+        confidence_threshold: float,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> dict[str, object]:
+        composite, mapping = self._build_skyline_composite(frame, model_info=model_info)
+        predict_options = {
+            "source": composite,
+            "conf": confidence_threshold,
+            "imgsz": int(model_info.get("imageSize") or self.settings.inference_image_size),
+            "device": self._runtime["device"],
+            "verbose": False,
+        }
+        if model_info.get("iouThreshold"):
+            predict_options["iou"] = float(model_info["iouThreshold"])
+
+        result = self._model.predict(**predict_options)[0]
+        items = self._detection_items_from_composite_result(
+            result,
+            mapping=mapping,
+            frame_width=frame.shape[1],
+            frame_height=frame.shape[0],
+            model_info=model_info,
+            pipeline=pipeline,
+        )
+        nms_iou = float(model_info.get("compositeNmsIou") or 0.5)
+        return {
+            "items": self._nms_detection_items(items, iou_threshold=nms_iou),
+            "composite": composite,
+        }
+
+    def _build_skyline_composite(self, frame, *, model_info: dict[str, object]):
+        frame_height, frame_width = frame.shape[:2]
+        target_size = int(model_info.get("imageSize") or self.settings.inference_image_size or 640)
+        target_size = max(320, target_size)
+        global_width = target_size
+        global_height = max(1, int(round(frame_height * (global_width / frame_width))))
+
+        if global_height >= target_size:
+            scale = target_size / frame_height
+            resized_width = max(1, int(round(frame_width * scale)))
+            global_view = cv2.resize(frame, (resized_width, target_size), interpolation=cv2.INTER_AREA)
+            composite = np.zeros((target_size, target_size, 3), dtype=frame.dtype)
+            offset_x = max(0, (target_size - resized_width) // 2)
+            composite[:, offset_x : offset_x + resized_width] = global_view
+            return composite, {
+                "targetSize": target_size,
+                "roiHeight": 0,
+                "global": {
+                    "scale": scale,
+                    "offsetX": offset_x,
+                    "offsetY": 0,
+                    "width": resized_width,
+                    "height": target_size,
+                },
+                "roi": None,
+            }
+
+        roi_height = target_size - global_height
+        global_view = cv2.resize(frame, (global_width, global_height), interpolation=cv2.INTER_AREA)
+        intermediate_width = int(model_info.get("compositeIntermediateWidth") or target_size * 2)
+        intermediate_width = max(target_size, intermediate_width)
+        intermediate_scale = intermediate_width / frame_width
+        intermediate_height = max(1, int(round(frame_height * intermediate_scale)))
+        intermediate = cv2.resize(frame, (intermediate_width, intermediate_height), interpolation=cv2.INTER_LINEAR)
+
+        crop_width = min(target_size, intermediate_width)
+        crop_height = min(roi_height, intermediate_height)
+        skyline_y = self._estimate_skyline_row(intermediate)
+        if skyline_y is None:
+            crop_top = max(0, (intermediate_height - crop_height) // 2)
+        else:
+            crop_top = int(round(skyline_y - crop_height * 0.25))
+            crop_top = min(max(crop_top, 0), max(0, intermediate_height - crop_height))
+        crop_left = max(0, (intermediate_width - crop_width) // 2)
+
+        roi = intermediate[crop_top : crop_top + crop_height, crop_left : crop_left + crop_width]
+        if roi.shape[0] != roi_height or roi.shape[1] != target_size:
+            roi = cv2.resize(roi, (target_size, roi_height), interpolation=cv2.INTER_LINEAR)
+
+        composite = np.vstack([roi, global_view])
+        if composite.shape[0] != target_size or composite.shape[1] != target_size:
+            composite = cv2.resize(composite, (target_size, target_size), interpolation=cv2.INTER_LINEAR)
+
+        return composite, {
+            "targetSize": target_size,
+            "roiHeight": roi_height,
+            "global": {
+                "scale": global_width / frame_width,
+                "offsetX": 0,
+                "offsetY": roi_height,
+                "width": global_width,
+                "height": global_height,
+            },
+            "roi": {
+                "scale": intermediate_scale,
+                "cropLeft": crop_left,
+                "cropTop": crop_top,
+                "sourceWidth": crop_width,
+                "sourceHeight": crop_height,
+                "displayWidth": target_size,
+                "displayHeight": roi_height,
+                "displayScaleX": crop_width / target_size,
+                "displayScaleY": crop_height / roi_height,
+                "skylineY": skyline_y,
+            },
+        }
+
+    @staticmethod
+    def _estimate_skyline_row(frame) -> int | None:
+        height, width = frame.shape[:2]
+        if height < 20 or width < 20:
+            return None
+
+        small_width = max(64, int(width * 0.25))
+        small_height = max(36, int(height * 0.25))
+        small = cv2.resize(frame, (small_width, small_height), interpolation=cv2.INTER_AREA)
+        hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+        bright_low_texture = (value > 95) & (saturation < 95)
+        blue_sky = (hue > 85) & (hue < 135) & (saturation > 25) & (value > 65)
+        sky_mask = bright_low_texture | blue_sky
+        row_ratios = sky_mask.mean(axis=1)
+
+        sky_rows = np.where(row_ratios > 0.42)[0]
+        if len(sky_rows) < max(3, int(small_height * 0.06)):
+            return None
+
+        first_sky = int(sky_rows[0])
+        for row in range(first_sky, small_height):
+            if row_ratios[row] < 0.18:
+                return int(round(row / small_height * height))
+
+        return int(round(int(sky_rows[-1]) / small_height * height))
+
+    def _detection_items_from_composite_result(
+        self,
+        result,
+        *,
+        mapping: dict[str, object],
+        frame_width: int,
+        frame_height: int,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> list[dict[str, object]]:
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or len(boxes) <= 0:
+            return []
+
+        xyxy = boxes.xyxy.detach().cpu().tolist() if getattr(boxes, "xyxy", None) is not None else []
+        confidences = boxes.conf.detach().cpu().tolist() if getattr(boxes, "conf", None) is not None else []
+        classes = boxes.cls.detach().cpu().tolist() if getattr(boxes, "cls", None) is not None else []
+        names = getattr(result, "names", {}) or {}
+
+        items: list[dict[str, object]] = []
+        for index, bbox_values in enumerate(xyxy):
+            if len(bbox_values) < 4:
+                continue
+
+            mapped = self._map_composite_bbox_to_frame(
+                tuple(float(value) for value in bbox_values[:4]),
+                mapping=mapping,
+                frame_width=frame_width,
+                frame_height=frame_height,
+            )
+            if not mapped:
+                continue
+
+            x1, y1, x2, y2, source_region = mapped
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            class_index = int(classes[index]) if index < len(classes) else 0
+            raw_class_name = str(names.get(class_index, class_index))
+            class_name = self._display_class_name(
+                raw_class_name,
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            confidence = float(confidences[index]) if index < len(confidences) else 0.0
+            items.append(
+                {
+                    "classIndex": class_index,
+                    "className": class_name,
+                    "confidence": confidence,
+                    "bbox": (x1, y1, x2, y2),
+                    "sourceRegion": source_region,
+                }
+            )
+
+        return items
+
+    @staticmethod
+    def _map_composite_bbox_to_frame(
+        bbox: tuple[float, float, float, float],
+        *,
+        mapping: dict[str, object],
+        frame_width: int,
+        frame_height: int,
+    ) -> tuple[float, float, float, float, str] | None:
+        x1, y1, x2, y2 = bbox
+        center_y = (y1 + y2) / 2.0
+        roi_height = float(mapping.get("roiHeight") or 0)
+        region = "roi" if roi_height > 0 and center_y < roi_height else "global"
+
+        if region == "roi":
+            roi = mapping.get("roi")
+            if not isinstance(roi, dict):
+                return None
+            display_scale_x = float(roi.get("displayScaleX") or 1.0)
+            display_scale_y = float(roi.get("displayScaleY") or 1.0)
+            crop_left = float(roi.get("cropLeft") or 0.0)
+            crop_top = float(roi.get("cropTop") or 0.0)
+            scale = float(roi.get("scale") or 1.0)
+
+            mapped_x1 = (crop_left + x1 * display_scale_x) / scale
+            mapped_x2 = (crop_left + x2 * display_scale_x) / scale
+            mapped_y1 = (crop_top + y1 * display_scale_y) / scale
+            mapped_y2 = (crop_top + y2 * display_scale_y) / scale
+        else:
+            global_mapping = mapping.get("global")
+            if not isinstance(global_mapping, dict):
+                return None
+            scale = float(global_mapping.get("scale") or 1.0)
+            offset_x = float(global_mapping.get("offsetX") or 0.0)
+            offset_y = float(global_mapping.get("offsetY") or 0.0)
+            width = float(global_mapping.get("width") or 0.0)
+            height = float(global_mapping.get("height") or 0.0)
+
+            clipped_x1 = min(max(x1, offset_x), offset_x + width)
+            clipped_x2 = min(max(x2, offset_x), offset_x + width)
+            clipped_y1 = min(max(y1, offset_y), offset_y + height)
+            clipped_y2 = min(max(y2, offset_y), offset_y + height)
+            mapped_x1 = (clipped_x1 - offset_x) / scale
+            mapped_x2 = (clipped_x2 - offset_x) / scale
+            mapped_y1 = (clipped_y1 - offset_y) / scale
+            mapped_y2 = (clipped_y2 - offset_y) / scale
+
+        mapped_x1 = min(max(mapped_x1, 0.0), float(frame_width))
+        mapped_x2 = min(max(mapped_x2, 0.0), float(frame_width))
+        mapped_y1 = min(max(mapped_y1, 0.0), float(frame_height))
+        mapped_y2 = min(max(mapped_y2, 0.0), float(frame_height))
+
+        return mapped_x1, mapped_y1, mapped_x2, mapped_y2, region
+
+    @classmethod
+    def _nms_detection_items(
+        cls,
+        items: list[dict[str, object]],
+        *,
+        iou_threshold: float,
+    ) -> list[dict[str, object]]:
+        threshold = min(max(float(iou_threshold), 0.05), 0.95)
+        ordered = sorted(items, key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
+        kept: list[dict[str, object]] = []
+
+        for item in ordered:
+            bbox = item.get("bbox")
+            if not isinstance(bbox, tuple) or len(bbox) < 4:
+                continue
+            should_keep = True
+            for kept_item in kept:
+                if int(item.get("classIndex") or 0) != int(kept_item.get("classIndex") or 0):
+                    continue
+                kept_bbox = kept_item.get("bbox")
+                if not isinstance(kept_bbox, tuple) or len(kept_bbox) < 4:
+                    continue
+                if cls._bbox_iou(bbox, kept_bbox) > threshold:
+                    should_keep = False
+                    break
+            if should_keep:
+                kept.append(item)
+
+        return kept
+
+    @staticmethod
+    def _bbox_iou(
+        first: tuple[float, float, float, float],
+        second: tuple[float, float, float, float],
+    ) -> float:
+        ax1, ay1, ax2, ay2 = [float(value) for value in first[:4]]
+        bx1, by1, bx2, by2 = [float(value) for value in second[:4]]
+        intersection_x1 = max(ax1, bx1)
+        intersection_y1 = max(ay1, by1)
+        intersection_x2 = min(ax2, bx2)
+        intersection_y2 = min(ay2, by2)
+        intersection_width = max(0.0, intersection_x2 - intersection_x1)
+        intersection_height = max(0.0, intersection_y2 - intersection_y1)
+        intersection_area = intersection_width * intersection_height
+        first_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        second_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union_area = first_area + second_area - intersection_area
+
+        if union_area <= 0.0:
+            return 0.0
+        return intersection_area / union_area
+
+    @classmethod
+    def _draw_detection_items(
+        cls,
+        frame,
+        items: list[dict[str, object]],
+        *,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> None:
+        for item in items:
+            bbox = item.get("bbox")
+            if not isinstance(bbox, tuple) or len(bbox) < 4:
+                continue
+            x1, y1, x2, y2 = [int(round(float(value))) for value in bbox[:4]]
+            class_name = cls._display_class_name(
+                str(item.get("className") or "detection"),
+                model_info=model_info,
+                pipeline=pipeline,
+            )
+            confidence = float(item.get("confidence") or 0.0)
+            label = f"{class_name} {confidence:.2f}"
+            color = (0, 128, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            label_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            label_y = max(y1, label_size[1] + baseline + 4)
+            cv2.rectangle(
+                frame,
+                (x1, label_y - label_size[1] - baseline - 4),
+                (x1 + label_size[0] + 8, label_y + baseline),
+                color,
+                -1,
+            )
+            cv2.putText(
+                frame,
+                label,
+                (x1 + 4, label_y - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    @classmethod
+    def _apply_display_labels(
+        cls,
+        result,
+        *,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> None:
+        names = getattr(result, "names", None)
+        if not isinstance(names, dict):
+            return
+
+        display_names = {
+            key: cls._display_class_name(str(value), model_info=model_info, pipeline=pipeline)
+            for key, value in names.items()
+        }
+        try:
+            result.names = display_names
+        except AttributeError:
+            names.update(display_names)
+
+    @classmethod
+    def _display_class_name(
+        cls,
+        class_name: str,
+        *,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> str:
+        if class_name.strip().lower() == "smoke" and cls._uses_thermal_model(
+            model_info=model_info,
+            pipeline=pipeline,
+        ):
+            return "fire"
+        return class_name
+
+    @staticmethod
+    def _uses_thermal_model(
+        *,
+        model_info: dict[str, object],
+        pipeline: dict[str, object],
+    ) -> bool:
+        sensor_type = str(pipeline.get("sensorType") or "").strip().lower()
+        model_id = str(model_info.get("id") or pipeline.get("currentModelId") or "").strip().lower()
+        model_name = str(model_info.get("name") or "").strip().lower()
+
+        return (
+            sensor_type in {"thermal", "ir", "infrared"}
+            or "thermal" in model_id
+            or "thermal" in model_name
+        )
+
+    @staticmethod
+    def _mask_polygons_for_result(result) -> list[list[tuple[float, float]]]:
+        masks = getattr(result, "masks", None)
+        polygons = getattr(masks, "xy", None)
+
+        if not polygons:
+            return []
+
+        out: list[list[tuple[float, float]]] = []
+        for polygon in polygons:
+            try:
+                out.append([(float(point[0]), float(point[1])) for point in polygon])
+            except (TypeError, ValueError, IndexError):
+                out.append([])
+        return out
+
+    @staticmethod
+    def _target_pixel_for_detection(
+        *,
+        bbox: tuple[float, float, float, float],
+        polygon: list[tuple[float, float]],
+    ) -> dict[str, object]:
+        x1, y1, x2, y2 = bbox
+
+        if polygon:
+            max_y = max(point[1] for point in polygon)
+            bottom_points = [point for point in polygon if point[1] >= max_y - 2.0]
+            if bottom_points:
+                x = sum(point[0] for point in bottom_points) / len(bottom_points)
+                return {
+                    "x": round(x, 2),
+                    "y": round(max_y, 2),
+                    "method": "mask-bottom",
+                }
+
+        return {
+            "x": round((x1 + x2) / 2.0, 2),
+            "y": round((y1 + y2) / 2.0, 2),
+            "method": "bbox-center",
+        }
+
+    def _detection_id(self, frame_at: str, index: int) -> str:
+        seed = f"{self.pipeline_id}|{frame_at}|{self._model_id}|{index}".encode("utf-8")
+        digest = hashlib.blake2s(seed, digest_size=8).hexdigest()
+        return f"{self.pipeline_id}-{digest}"
+
+    def _update_detections(self, detections: dict[str, object]) -> None:
+        with self._lock:
+            self._latest_detections = detections
 
     def _ensure_model(self, pipeline: dict[str, object]) -> dict[str, object] | None:
         desired_model_id = str(pipeline.get("currentModelId") or "")
@@ -716,6 +1432,7 @@ class DroneWorker:
             self._latest_processed_frame_jpeg = None
             self._runtime["latestFrameAvailable"] = False
             self._runtime["latestProcessedFrameAvailable"] = False
+            self._latest_detections = self._empty_detections()
 
     def _clear_preview(self) -> None:
         self._stop_processed_publisher()
@@ -725,10 +1442,12 @@ class DroneWorker:
             self._runtime["latestFrameAvailable"] = False
             self._runtime["latestProcessedFrameAvailable"] = False
             self._runtime["latestRawFrameAvailable"] = False
+            self._latest_detections = self._empty_detections()
 
     def _update_runtime_after_frame(
         self,
         *,
+        frame_at: str,
         frame_width: int,
         frame_height: int,
         source_fps: float,
@@ -736,8 +1455,8 @@ class DroneWorker:
         detection_count: int,
         max_confidence: float,
         event: EventUpdate,
+        second_stage_summary: SecondStageSummary,
     ) -> None:
-        now_iso = utc_now()
         self._fps_window.append(time.monotonic())
         processing_fps = 0.0
         if len(self._fps_window) >= 2:
@@ -771,12 +1490,21 @@ class DroneWorker:
                     "framesProcessed": frames_processed,
                     "detectionsTotal": detections_total,
                     "avgInferenceMs": round(avg_inference_ms, 2),
-                    "lastFrameAt": now_iso,
+                    "lastFrameAt": frame_at,
                     "currentEvent": event.active_event,
+                    "secondStageEnabled": second_stage_summary.enabled,
+                    "secondStageApplied": second_stage_summary.applied,
+                    "secondStageAvailable": second_stage_summary.available,
+                    "secondStageSentToClassifier": second_stage_summary.sent_to_classifier,
+                    "secondStageRejectedByClassifier": second_stage_summary.rejected_by_classifier,
+                    "secondStageDroppedLow": second_stage_summary.dropped_low,
+                    "secondStageKeptAfterClassifier": second_stage_summary.kept_after_classifier,
+                    "secondStageLastMs": round(float(second_stage_summary.elapsed_ms), 2),
+                    "secondStageLastReason": second_stage_summary.reason,
                 }
             )
             if detection_count:
-                self._runtime["lastDetectionAt"] = now_iso
+                self._runtime["lastDetectionAt"] = frame_at
                 self._runtime["lastDetectionCount"] = int(detection_count)
                 self._runtime["lastDetectionConfidence"] = round(float(max_confidence), 4)
 
