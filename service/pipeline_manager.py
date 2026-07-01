@@ -94,7 +94,11 @@ class PipelineManager:
         pipeline["lastTelemetryAt"] = state["lastTelemetryAt"]
         pipeline["currentModelId"] = self._select_model_id(pipeline, str(pipeline["sensorType"]))
         pipeline["updatedAt"] = utc_now()
-        if pipeline["analyticsEnabled"]:
+        if not pipeline["analyticsEnabled"]:
+            pipeline["status"] = "disabled"
+        elif not pipeline.get("sourceOnline", True):
+            pipeline["status"] = "waiting_source"
+        else:
             pipeline["status"] = "configured"
         restart_required = self._worker_restart_required(previous, pipeline)
         self._ensure_worker(key, restart=restart_required)
@@ -111,6 +115,46 @@ class PipelineManager:
     def latest_raw_frame(self, drone_id: str) -> bytes | None:
         worker = self._workers.get(str(drone_id or "").strip())
         return worker.latest_raw_frame() if worker else None
+
+    def latest_detections(self, drone_id: str) -> dict[str, object] | None:
+        key = str(drone_id or "").strip()
+        if key not in self._pipelines:
+            return None
+
+        worker = self._workers.get(key)
+        if worker:
+            return worker.latest_detections()
+
+        pipeline = self._pipelines.get(key, {})
+        return {
+            "droneId": key,
+            "frameAt": "",
+            "modelId": str(pipeline.get("currentModelId") or ""),
+            "modelName": "",
+            "sensorType": str(pipeline.get("sensorType") or "unknown"),
+            "frameWidth": None,
+            "frameHeight": None,
+            "items": [],
+        }
+
+    def buffered_frames(
+        self,
+        drone_id: str,
+        *,
+        variant: str,
+        delay_seconds: float,
+        after_seq: int = 0,
+        limit: int = 4,
+    ) -> list[tuple[int, bytes]]:
+        worker = self._workers.get(str(drone_id or "").strip())
+        if not worker:
+            return []
+        return worker.buffered_frames(
+            variant=variant,
+            delay_seconds=delay_seconds,
+            after_seq=after_seq,
+            limit=limit,
+        )
 
     def _select_model_id(self, pipeline: dict[str, object], sensor_type: str) -> str:
         if str(pipeline.get("modelSelectionMode", "manual")) == "auto":
@@ -130,6 +174,8 @@ class PipelineManager:
     ) -> str:
         if not pipeline["analyticsEnabled"]:
             return "disabled"
+        if not pipeline.get("sourceOnline", True):
+            return "waiting_source"
         if previous and previous.get("status") == "running":
             return "running"
         return "configured"
@@ -153,6 +199,7 @@ class PipelineManager:
             pipeline["sensorType"] = str(item.get("sensorType") or "unknown")
             pipeline["currentModelId"] = self._select_model_id(pipeline, str(pipeline["sensorType"]))
             pipeline["processedRtspUrl"] = self.settings.processed_stream_url(drone_id)
+            pipeline["sourceOnline"] = bool(item.get("sourceOnline", True))
             pipeline["status"] = self._status_for_pipeline(pipeline, item)
             self._pipelines[drone_id] = pipeline
 
@@ -184,12 +231,16 @@ class PipelineManager:
                     "droneName": pipeline["droneName"],
                     "rtspUrl": pipeline["rtspUrl"],
                     "analyticsEnabled": pipeline["analyticsEnabled"],
+                    "sourceOnline": pipeline.get("sourceOnline", True),
                     "modelSelectionMode": pipeline["modelSelectionMode"],
                     "manualModelId": pipeline["manualModelId"],
                     "autoModelMap": dict(pipeline.get("autoModelMap", {})),
                     "confidenceThreshold": pipeline["confidenceThreshold"],
                     "processingFps": pipeline["processingFps"],
                     "recordOnEvent": pipeline["recordOnEvent"],
+                    "recordingSegmentMode": pipeline["recordingSegmentMode"],
+                    "recordingSegmentMinutes": pipeline["recordingSegmentMinutes"],
+                    "recordingSegmentMaxMb": pipeline["recordingSegmentMaxMb"],
                     "videoSourceMode": pipeline["videoSourceMode"],
                     "createdAt": pipeline["createdAt"],
                     "updatedAt": pipeline["updatedAt"],
@@ -220,9 +271,10 @@ class PipelineManager:
             public["runtime"] = runtime
             public["processedStreamReady"] = bool(runtime.get("processedStreamReady"))
         else:
+            source_online = bool(pipeline.get("sourceOnline", True))
             public["runtime"] = {
-                "status": "disabled" if not pipeline["analyticsEnabled"] else "configured",
-                "message": "worker not running",
+                "status": "disabled" if not pipeline["analyticsEnabled"] else ("configured" if source_online else "waiting_source"),
+                "message": "worker not running" if source_online else "media source is offline",
                 "sourceOpened": False,
                 "sourceType": "unknown",
                 "sourceUrl": "",
@@ -263,6 +315,9 @@ class PipelineManager:
             self._stop_worker(drone_id)
             return
         if not pipeline["analyticsEnabled"]:
+            self._stop_worker(drone_id)
+            return
+        if not pipeline.get("sourceOnline", True):
             self._stop_worker(drone_id)
             return
         worker = self._workers.get(drone_id)
@@ -317,14 +372,4 @@ class PipelineManager:
     ) -> bool:
         if not previous:
             return False
-        previous_auto_model_map = previous.get("autoModelMap") if isinstance(previous.get("autoModelMap"), dict) else {}
-        next_auto_model_map = next_pipeline.get("autoModelMap") if isinstance(next_pipeline.get("autoModelMap"), dict) else {}
-        return (
-            str(previous.get("rtspUrl") or "") != str(next_pipeline.get("rtspUrl") or "")
-            or str(previous.get("currentModelId") or "") != str(next_pipeline.get("currentModelId") or "")
-            or str(previous.get("manualModelId") or "") != str(next_pipeline.get("manualModelId") or "")
-            or str(previous.get("modelSelectionMode") or "") != str(next_pipeline.get("modelSelectionMode") or "")
-            or float(previous.get("confidenceThreshold") or 0.0) != float(next_pipeline.get("confidenceThreshold") or 0.0)
-            or float(previous.get("processingFps") or 0.0) != float(next_pipeline.get("processingFps") or 0.0)
-            or dict(previous_auto_model_map) != dict(next_auto_model_map)
-        )
+        return str(previous.get("rtspUrl") or "") != str(next_pipeline.get("rtspUrl") or "")

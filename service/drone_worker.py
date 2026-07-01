@@ -116,7 +116,7 @@ def cleanup_orphaned_processed_publishers(active_output_urls: set[str]) -> None:
         _terminate_ffmpeg_process(pid)
 
 
-class _FfmpegMjpegReader:
+class _FfmpegY4mReader:
     def __init__(
         self,
         *,
@@ -126,14 +126,17 @@ class _FfmpegMjpegReader:
     ) -> None:
         self.source = source
         self._process: subprocess.Popen[bytes] | None = None
-        self._buffer = bytearray()
         self._read_timeout_seconds = max(0.5, float(read_timeout_seconds))
+        self._width = 0
+        self._height = 0
+        self._fps = 0.0
+        self._frame_size = 0
+        self._header_ready = False
         self._duplicate_frame_count = 0
         self._last_frame_digest: bytes | None = None
         self._last_unique_frame_at = time.monotonic()
-        self._stale_frame_timeout_seconds = max(self._read_timeout_seconds * 2.0, 6.0)
-        self._stale_frame_count = 30
         self._startup_deadline = time.monotonic() + max(self._read_timeout_seconds * 3.0, 12.0)
+        _terminate_matching_ffmpeg_processes(source, required_tokens=("yuv4mpegpipe",))
         _terminate_matching_ffmpeg_processes(source, required_tokens=("image2pipe",))
         self._command = [
             ffmpeg_path,
@@ -150,6 +153,10 @@ class _FfmpegMjpegReader:
             "1000000",
             "-rtbufsize",
             "100M",
+            "-max_delay",
+            "500000",
+            "-flags",
+            "low_delay",
             "-use_wallclock_as_timestamps",
             "1",
             "-i",
@@ -157,12 +164,10 @@ class _FfmpegMjpegReader:
             "-an",
             "-fps_mode",
             "passthrough",
+            "-pix_fmt",
+            "yuv420p",
             "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-q:v",
-            "5",
+            "yuv4mpegpipe",
             "pipe:1",
         ]
         self._process = subprocess.Popen(
@@ -183,43 +188,126 @@ class _FfmpegMjpegReader:
         if not self._process or not self._process.stdout:
             return False, None
 
-        stdout = self._process.stdout
-        start_marker = b"\xff\xd8"
-        end_marker = b"\xff\xd9"
+        if not self._header_ready and not self._read_y4m_header():
+            return False, None
+
+        frame_header = self._read_line()
+        if not frame_header or not frame_header.startswith(b"FRAME"):
+            return False, None
+
+        payload = self._read_exact(self._frame_size)
+        if payload is None:
+            return False, None
+
+        self._track_duplicate_frame(payload)
+        try:
+            yuv = np.frombuffer(payload, dtype=np.uint8).reshape((self._height * 3 // 2, self._width))
+            frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420)
+        except (ValueError, cv2.error):
+            return False, None
+
+        return True, frame
+
+    def get(self, prop_id: int) -> float:
+        if prop_id == cv2.CAP_PROP_FPS:
+            return self._fps
+        if prop_id == cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self._width)
+        if prop_id == cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self._height)
+        return 0.0
+
+    def _read_y4m_header(self) -> bool:
+        header = self._read_line()
+        if not header or not header.startswith(b"YUV4MPEG2 "):
+            return False
+
+        width = 0
+        height = 0
+        fps = 0.0
+
+        for raw_token in header.split()[1:]:
+            token = raw_token.decode("ascii", errors="ignore")
+            if token.startswith("W"):
+                try:
+                    width = int(token[1:])
+                except ValueError:
+                    width = 0
+            elif token.startswith("H"):
+                try:
+                    height = int(token[1:])
+                except ValueError:
+                    height = 0
+            elif token.startswith("F") and ":" in token:
+                try:
+                    numerator, denominator = token[1:].split(":", 1)
+                    den = float(denominator)
+                    fps = float(numerator) / den if den else 0.0
+                except ValueError:
+                    fps = 0.0
+
+        if width <= 0 or height <= 0:
+            return False
+
+        self._width = width
+        self._height = height
+        self._fps = fps
+        self._frame_size = width * height * 3 // 2
+        self._header_ready = True
+        self._startup_deadline = 0.0
+        return True
+
+    def _read_line(self) -> bytes | None:
+        line = bytearray()
 
         while True:
-            start_index = self._buffer.find(start_marker)
-            if start_index != -1:
-                end_index = self._buffer.find(end_marker, start_index + 2)
-                if end_index != -1:
-                    jpeg_bytes = bytes(self._buffer[start_index : end_index + 2])
-                    del self._buffer[: end_index + 2]
-                    self._track_duplicate_frame(jpeg_bytes)
-                    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    return (frame is not None), frame
+            chunk = self._read_chunk(1)
+            if chunk is None:
+                return None
+            if chunk == b"\n":
+                return bytes(line).rstrip(b"\r")
+            line.extend(chunk)
+            if len(line) > 4096:
+                return None
 
+    def _read_exact(self, size: int) -> bytes | None:
+        payload = bytearray()
+        remaining = size
+
+        while remaining > 0:
+            chunk = self._read_chunk(min(remaining, 256 * 1024))
+            if chunk is None:
+                return None
+            payload.extend(chunk)
+            remaining -= len(chunk)
+
+        return bytes(payload)
+
+    def _read_chunk(self, size: int) -> bytes | None:
+        if not self._process or not self._process.stdout:
+            return None
+
+        stdout = self._process.stdout
+        while True:
             try:
                 ready, _, _ = select.select([stdout], [], [], self._read_timeout_seconds)
             except (OSError, ValueError):
-                return False, None
+                return None
             if not ready:
                 if time.monotonic() < self._startup_deadline:
                     continue
-                # ffmpeg can hang with an open socket and stop producing bytes.
-                # Return False so the worker reconnects the source automatically.
-                return False, None
+                return None
 
-            chunk = stdout.read(4 * 1024)
+            try:
+                chunk = stdout.read(size)
+            except (OSError, ValueError):
+                return None
             if not chunk:
-                return False, None
-            self._buffer.extend(chunk)
-            if self._startup_deadline:
-                self._startup_deadline = 0.0
-            if len(self._buffer) > 8 * 1024 * 1024:
-                del self._buffer[: 4 * 1024 * 1024]
+                return None
+            return bytes(chunk)
 
-    def _track_duplicate_frame(self, jpeg_bytes: bytes) -> None:
-        digest = hashlib.blake2s(jpeg_bytes, digest_size=8).digest()
+    def _track_duplicate_frame(self, frame_bytes: bytes) -> None:
+        digest = hashlib.blake2s(frame_bytes, digest_size=8).digest()
         now = time.monotonic()
 
         if digest != self._last_frame_digest:
@@ -564,7 +652,7 @@ class DroneWorker:
     def _open_capture(self, source: str):
         normalized = source.strip().lower()
         if normalized.startswith("rtsp://"):
-            ffmpeg_reader = _FfmpegMjpegReader(
+            ffmpeg_reader = _FfmpegY4mReader(
                 ffmpeg_path=self.settings.ffmpeg_path,
                 source=source,
                 read_timeout_seconds=self.settings.rtsp_read_timeout_seconds,
@@ -582,13 +670,13 @@ class DroneWorker:
 
     @staticmethod
     def _capture_backend_name(capture) -> str:
-        if isinstance(capture, _FfmpegMjpegReader):
-            return "ffmpeg-mjpeg-reader"
+        if isinstance(capture, _FfmpegY4mReader):
+            return "ffmpeg-y4m-reader"
         return "opencv-videocapture"
 
     @staticmethod
     def _capture_pid(capture) -> int | None:
-        if isinstance(capture, _FfmpegMjpegReader):
+        if isinstance(capture, _FfmpegY4mReader):
             return capture.pid
         return None
 

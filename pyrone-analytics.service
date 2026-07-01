@@ -1,0 +1,26 @@
+[Unit]
+Description=PYRONE Analytics Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=belator
+Group=belator
+WorkingDirectory=/home/belator/Desktop/PyrOne/IA Belator
+Environment=PYRONE_IA_HOST=0.0.0.0
+Environment=PYRONE_IA_PORT=8765
+Environment=PYRONE_INFERENCE_DEVICE=0
+Environment=PYRONE_PROCESSED_RTSP_HOST=127.0.0.1
+Environment=PYRONE_PROCESSED_RTSP_PORT=8554
+Environment=PYRONE_PROCESSED_RTSP_ENABLED=true
+Environment=PYRONE_PROCESSED_RTSP_BITRATE=5000k
+Environment=PYRONE_PROCESSED_RTSP_BUFSIZE=10000k
+Environment=PYRONE_PROCESSED_RTSP_PRESET=veryfast
+Environment=PYRONE_PREVIEW_JPEG_QUALITY=92
+ExecStart=/usr/bin/bash -lc 'cd "/home/belator/Desktop/PyrOne/IA Belator" && exec /usr/bin/python3 -m service.main'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

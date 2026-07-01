@@ -239,7 +239,7 @@ def load_settings() -> ServiceSettings:
             max(_read_int("PYRONE_RECORDING_SEGMENT_MAX_MB", 200), 20),
             4096,
         ),
-        preview_jpeg_quality=min(max(_read_int("PYRONE_PREVIEW_JPEG_QUALITY", 80), 30), 100),
+        preview_jpeg_quality=min(max(_read_int("PYRONE_PREVIEW_JPEG_QUALITY", 92), 30), 100),
         max_frame_width=max(320, _read_int("PYRONE_MAX_FRAME_WIDTH", 1280)),
         mjpeg_buffer_seconds=min(
             max(_read_float("PYRONE_MJPEG_BUFFER_SECONDS", 1.0), 0.0),
