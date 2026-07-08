@@ -400,7 +400,7 @@ class DroneWorker:
             "processedStreamRevision": 0,
             "processedStreamStartedAt": "",
             "device": resolved_device,
-            "secondStageEnabled": self.settings.second_stage_enabled,
+            "secondStageEnabled": self.settings.second_stage_enabled and bool(pipeline.get("secondStageEnabled", True)),
             "secondStageApplied": False,
             "secondStageAvailable": self.settings.second_stage_model_path.exists(),
             "secondStageModelPath": str(self.settings.second_stage_model_path),

@@ -44,7 +44,7 @@ class SecondStageClassifier:
     ):
         if not self._should_apply(model_info=model_info, pipeline=pipeline):
             return result, SecondStageSummary(
-                enabled=self.settings.second_stage_enabled,
+                enabled=self._effective_enabled(pipeline),
                 applied=False,
                 available=self._weights_path().exists(),
                 reason=self._skip_reason(model_info=model_info, pipeline=pipeline),
@@ -117,7 +117,7 @@ class SecondStageClassifier:
     ) -> tuple[list[dict[str, object]], SecondStageSummary]:
         if not self._should_apply(model_info=model_info, pipeline=pipeline):
             return items, SecondStageSummary(
-                enabled=self.settings.second_stage_enabled,
+                enabled=self._effective_enabled(pipeline),
                 applied=False,
                 available=self._weights_path().exists(),
                 reason=self._skip_reason(model_info=model_info, pipeline=pipeline),
@@ -190,6 +190,16 @@ class SecondStageClassifier:
         if not self._should_apply(model_info=model_info, pipeline=pipeline):
             return requested_threshold
         return min(float(requested_threshold), self.settings.second_stage_conf_low)
+
+    def _effective_enabled(self, pipeline: dict[str, object]) -> bool:
+        return self.settings.second_stage_enabled and self._pipeline_enabled(pipeline)
+
+    @staticmethod
+    def _pipeline_enabled(pipeline: dict[str, object]) -> bool:
+        value = pipeline.get("secondStageEnabled", True)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() not in {"0", "false", "no", "off"}
 
     def _decision_for_candidate(
         self,
@@ -278,7 +288,7 @@ class SecondStageClassifier:
         return str(class_index)
 
     def _should_apply(self, *, model_info: dict[str, object], pipeline: dict[str, object]) -> bool:
-        if not self.settings.second_stage_enabled:
+        if not self._effective_enabled(pipeline):
             return False
         if self.settings.second_stage_conf_low >= self.settings.second_stage_conf_high:
             return False
@@ -292,7 +302,9 @@ class SecondStageClassifier:
 
     def _skip_reason(self, *, model_info: dict[str, object], pipeline: dict[str, object]) -> str:
         if not self.settings.second_stage_enabled:
-            return "disabled"
+            return "disabled globally"
+        if not self._pipeline_enabled(pipeline):
+            return "disabled for drone"
         if self.settings.second_stage_conf_low >= self.settings.second_stage_conf_high:
             return "invalid confidence band"
         if not self._weights_path().exists():
