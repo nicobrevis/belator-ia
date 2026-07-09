@@ -25,6 +25,34 @@ from service.second_stage_classifier import SecondStageClassifier, SecondStageSu
 from service.settings import ServiceSettings
 
 
+_PYRONE_WATERMARK_IMAGE: np.ndarray | None = None
+_PYRONE_WATERMARK_LOOKED_UP = False
+
+
+def _load_pyrone_watermark_image() -> np.ndarray | None:
+    global _PYRONE_WATERMARK_IMAGE, _PYRONE_WATERMARK_LOOKED_UP
+
+    if _PYRONE_WATERMARK_LOOKED_UP:
+        return _PYRONE_WATERMARK_IMAGE
+
+    _PYRONE_WATERMARK_LOOKED_UP = True
+    service_dir = Path(__file__).resolve().parent
+    candidates = [
+        service_dir / "img" / "Pyrone_2.png",
+        service_dir.parent / "img" / "Pyrone_2.png",
+        service_dir.parent.parent / "img" / "Pyrone_2.png",
+    ]
+
+    for candidate in candidates:
+        image = cv2.imread(str(candidate), cv2.IMREAD_UNCHANGED)
+
+        if image is not None:
+            _PYRONE_WATERMARK_IMAGE = image
+            return _PYRONE_WATERMARK_IMAGE
+
+    return None
+
+
 def _ffmpeg_processes() -> list[tuple[int, list[str]]]:
     processes: list[tuple[int, list[str]]] = []
     proc_root = Path("/proc")
@@ -1696,8 +1724,35 @@ class DroneWorker:
 
     @staticmethod
     def _overlay_status(frame, *, model_name: str, detection_count: int, max_confidence: float, sensor_type: str) -> None:
+        _ = model_name
+        watermark = _load_pyrone_watermark_image()
+        if watermark is not None and frame.size:
+            frame_height, frame_width = frame.shape[:2]
+            size = max(72, min(140, int(min(frame_width, frame_height) * 0.18)))
+            resized = cv2.resize(watermark, (size, size), interpolation=cv2.INTER_AREA)
+            logo_x = 14
+            logo_y = 10
+            max_width = max(0, frame_width - logo_x)
+            max_height = max(0, frame_height - logo_y)
+            resized = resized[:max_height, :max_width]
+
+            if resized.size:
+                if resized.ndim == 2:
+                    logo_bgr = cv2.cvtColor(resized, cv2.COLOR_GRAY2BGR)
+                    alpha = np.ones(resized.shape[:2], dtype=np.float32)
+                else:
+                    logo_bgr = resized[:, :, :3]
+                    alpha = np.ones(resized.shape[:2], dtype=np.float32)
+
+                if resized.ndim == 3 and resized.shape[2] == 4:
+                    alpha = resized[:, :, 3].astype(np.float32) / 255.0
+
+                alpha = (alpha * 0.16)[:, :, None]
+                roi = frame[logo_y : logo_y + resized.shape[0], logo_x : logo_x + resized.shape[1]]
+                blended = (logo_bgr.astype(np.float32) * alpha) + (roi.astype(np.float32) * (1.0 - alpha))
+                frame[logo_y : logo_y + resized.shape[0], logo_x : logo_x + resized.shape[1]] = blended.astype(np.uint8)
+
         lines = [
-            f"Model: {model_name or '-'}",
             f"Sensor: {sensor_type or 'unknown'}",
             (
                 f"Detections: {detection_count}  Max conf: {max_confidence:.2f}"
