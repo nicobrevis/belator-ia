@@ -76,6 +76,84 @@ class CaptureInferenceQueueTests(unittest.TestCase):
         self.assertEqual(worker._processed_publisher_retry_delay, 2.0)
         self.assertEqual(worker._processed_publisher_next_retry_at, 0.0)
 
+    def test_publisher_failure_reason_is_persisted_before_replacement(self) -> None:
+        worker = object.__new__(DroneWorker)
+        worker._lock = threading.Lock()
+        worker._pipeline = {"droneId": "drone-1"}
+        worker._runtime = {
+            "processedPublisherFailureCount": 0,
+            "processedPublisherLastFailureReason": "",
+            "processedPublisherLastFailureAt": "",
+        }
+
+        with (
+            patch("service.drone_worker.utc_now", return_value="2026-07-13T16:13:17.000+00:00"),
+            patch("builtins.print") as log,
+        ):
+            worker._record_processed_publisher_failure(
+                "processed publisher operational write timed out\n",
+            )
+
+        self.assertEqual(worker._runtime["processedPublisherFailureCount"], 1)
+        self.assertEqual(
+            worker._runtime["processedPublisherLastFailureReason"],
+            "processed publisher operational write timed out",
+        )
+        self.assertEqual(
+            worker._runtime["processedPublisherLastFailureAt"],
+            "2026-07-13T16:13:17.000+00:00",
+        )
+        log.assert_called_once()
+
+    def test_publisher_creation_failure_is_sanitized_before_persisting(self) -> None:
+        output_url = "rtmp://publisher:secret@media.internal:1935/processed/drone-1"
+        worker = object.__new__(DroneWorker)
+        worker._lock = threading.Lock()
+        worker._pipeline = {"droneId": "drone-1"}
+        worker._runtime = {"processedPublisherFailureCount": 0}
+        worker._processed_publisher = None
+        worker._processed_publisher_signature = None
+        worker._processed_publisher_next_retry_at = 0.0
+        worker._processed_publisher_retry_delay = 2.0
+        worker._processed_publisher_start_count = 0
+        worker.settings = SimpleNamespace(
+            legacy_mjpeg_enabled=False,
+            processed_rtsp_enabled=True,
+            processed_publish_transport="rtmp",
+            processed_publish_max_fps=20.0,
+            processed_publish_url=lambda _drone_id, _source_url: output_url,
+            ffmpeg_path="ffmpeg",
+            processed_rtsp_bitrate="2500k",
+            processed_rtsp_bufsize="5000k",
+            processed_rtsp_preset="veryfast",
+            processed_rtsp_write_timeout_seconds=8.0,
+            processed_publish_startup_timeout_seconds=25.0,
+            processed_publish_ready_after_seconds=2.0,
+            processed_publish_ready_freshness_seconds=2.0,
+            processed_publish_stable_reset_seconds=20.0,
+            processed_publish_stale_seconds=8.0,
+            processed_publish_retry_max_seconds=30.0,
+        )
+
+        with (
+            patch(
+                "service.drone_worker.FfmpegFramePublisher",
+                side_effect=ValueError(f"could not open {output_url}"),
+            ),
+            patch("builtins.print"),
+        ):
+            worker._publish_processed_frame(
+                np.zeros((2, 2, 3), dtype=np.uint8),
+                fps=20.0,
+                source_url="rtsp://media.internal/live/drone-1",
+            )
+
+        persisted_reason = str(worker._runtime["processedPublisherLastFailureReason"])
+        self.assertNotIn("secret", persisted_reason)
+        self.assertIn("publisher:******@", persisted_reason)
+        self.assertEqual(worker._runtime["processedPublisherError"], persisted_reason)
+        self.assertEqual(worker._runtime["processedPublisherFailureCount"], 1)
+
     def test_burst_keeps_latest_frame_and_reports_drops(self) -> None:
         worker = object.__new__(DroneWorker)
         worker._stop_event = threading.Event()

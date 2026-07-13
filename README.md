@@ -52,9 +52,11 @@ fallback. El worker reintenta la publicacion con backoff y nunca expone la
 contrasena de una URL en su estado de runtime.
 
 El handshake inicial usa un timeout separado de 25 segundos. Una vez establecida
-la salida, cada escritura tiene un timeout de 3 segundos. La salida solo pasa a
-`ready` tras 2 segundos con proceso vivo y frames frescos; el backoff acumulado
-se reinicia unicamente despues de 20 segundos de estabilidad sostenida. Estos
+la salida, cada escritura tiene un timeout minimo de 8 segundos. La salida solo
+pasa a `ready` tras 2 segundos con proceso vivo y escrituras recientes. Una pausa
+temporal de inferencia conserva el ultimo frame a CFR sin desmontar RTMP/HLS; el
+ingest del worker decide cuando cerrar la publicacion. El backoff acumulado se
+reinicia unicamente despues de 20 segundos de estabilidad sostenida. Estos
 umbrales se controlan con `PYRONE_PROCESSED_PUBLISH_STARTUP_TIMEOUT_SECONDS`,
 `PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS`,
 `PYRONE_PROCESSED_PUBLISH_READY_AFTER_SECONDS`,

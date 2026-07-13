@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from service.processed_publisher import (
+    MIN_OPERATIONAL_WRITE_TIMEOUT_SECONDS,
     PUBLISHER_PROCESS_MARKER,
     build_ffmpeg_publisher_command,
     sanitize_stream_url,
@@ -52,6 +53,58 @@ class _EmptyStderr:
     @staticmethod
     def close() -> None:
         return
+
+
+class _AcceptingStdin:
+    def __init__(self) -> None:
+        self.write_count = 0
+
+    def write(self, payload) -> int:
+        self.write_count += 1
+        return len(payload)
+
+    @staticmethod
+    def close() -> None:
+        return
+
+
+class _FirstWriteThenBlockingStdin:
+    def __init__(self, stopped: threading.Event) -> None:
+        self._stopped = stopped
+        self.write_count = 0
+
+    def write(self, payload) -> int:
+        self.write_count += 1
+        if self.write_count == 1:
+            return len(payload)
+        self._stopped.wait(2.0)
+        raise BrokenPipeError("fake operational publisher stopped")
+
+    @staticmethod
+    def close() -> None:
+        return
+
+
+class _RunningPublisherProcess:
+    pid = 999998
+
+    def __init__(self, stdin=None) -> None:
+        self.stopped = threading.Event()
+        self.stdin = stdin or _AcceptingStdin()
+        self.stderr = _EmptyStderr()
+
+    def poll(self):
+        return 1 if self.stopped.is_set() else None
+
+    def terminate(self) -> None:
+        self.stopped.set()
+
+    def kill(self) -> None:
+        self.stopped.set()
+
+    @staticmethod
+    def wait(timeout=None) -> int:
+        return 0
 
 
 class _BlockingPublisherProcess:
@@ -104,6 +157,82 @@ def _publisher_timing_fixture() -> tuple[FfmpegFramePublisher, _FakePublisherPro
 
 
 class ProcessedPublisherTests(unittest.TestCase):
+    def test_stale_input_keeps_last_frame_flowing_without_killing_process(self) -> None:
+        process = _RunningPublisherProcess()
+        with patch("service.processed_publisher.subprocess.Popen", return_value=process):
+            publisher = FfmpegFramePublisher(
+                ffmpeg_path="ffmpeg",
+                output_url="rtmp://media.internal:1935/processed/drone-1",
+                transport="rtmp",
+                width=2,
+                height=2,
+                fps=20.0,
+                bitrate="2500k",
+                bufsize="5000k",
+                preset="veryfast",
+                write_timeout_seconds=3.0,
+                startup_timeout_seconds=15.0,
+                ready_after_seconds=2.0,
+                ready_freshness_seconds=2.0,
+                stable_reset_seconds=20.0,
+                stale_frame_seconds=0.05,
+            )
+
+        self.assertEqual(
+            publisher.write_timeout_seconds,
+            MIN_OPERATIONAL_WRITE_TIMEOUT_SECONDS,
+        )
+        publisher.stale_frame_seconds = 0.05
+        publisher.ready_after_seconds = 0.05
+        publisher.ready_freshness_seconds = 0.15
+        self.assertTrue(publisher.write(bytes(12)))
+
+        deadline = time.monotonic() + 1.0
+        while publisher.frames_written < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        first_written = publisher.frames_written
+        time.sleep(0.2)
+
+        self.assertGreater(first_written, 0)
+        self.assertGreater(publisher.frames_written, first_written)
+        self.assertTrue(publisher.is_running())
+        self.assertTrue(publisher.ready)
+        self.assertFalse(process.stopped.is_set())
+        self.assertEqual(publisher.last_error, "")
+        publisher.release()
+
+    def test_watchdog_terminates_an_actually_blocked_operational_write(self) -> None:
+        process = _RunningPublisherProcess()
+        process.stdin = _FirstWriteThenBlockingStdin(process.stopped)
+        with patch("service.processed_publisher.subprocess.Popen", return_value=process):
+            publisher = FfmpegFramePublisher(
+                ffmpeg_path="ffmpeg",
+                output_url="rtmp://media.internal:1935/processed/drone-1",
+                transport="rtmp",
+                width=2,
+                height=2,
+                fps=20.0,
+                bitrate="2500k",
+                bufsize="5000k",
+                preset="veryfast",
+                write_timeout_seconds=8.0,
+                startup_timeout_seconds=15.0,
+                ready_after_seconds=2.0,
+                ready_freshness_seconds=2.0,
+                stable_reset_seconds=20.0,
+                stale_frame_seconds=8.0,
+            )
+        publisher.write_timeout_seconds = 0.15
+        self.assertTrue(publisher.write(bytes(12)))
+
+        deadline = time.monotonic() + 1.0
+        while not process.stopped.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        self.assertTrue(process.stopped.is_set())
+        self.assertIn("operational write", publisher.last_error)
+        publisher.release()
+
     def test_watchdog_terminates_an_actually_blocked_handshake_write(self) -> None:
         process = _BlockingPublisherProcess()
         with patch("service.processed_publisher.subprocess.Popen", return_value=process):
@@ -156,7 +285,7 @@ class ProcessedPublisherTests(unittest.TestCase):
         self.assertTrue(process.terminated)
         self.assertIn("operational write", publisher.last_error)
 
-    def test_ready_requires_stability_liveness_and_fresh_frames(self) -> None:
+    def test_ready_requires_stability_liveness_and_fresh_writes(self) -> None:
         publisher, _process = _publisher_timing_fixture()
         publisher._first_write_at = 100.0
         publisher._write_started_at = 0.0
@@ -177,8 +306,9 @@ class ProcessedPublisherTests(unittest.TestCase):
             self.assertFalse(publisher.ready)
 
         publisher._last_write_at = 121.0
-        publisher._last_input_at = 121.0
+        publisher._last_input_at = 100.0
         with patch("service.processed_publisher.time.monotonic", return_value=121.0):
+            self.assertTrue(publisher.ready)
             self.assertTrue(publisher.stable)
 
     def test_rtmp_command_is_low_latency_h264_and_cfr(self) -> None:

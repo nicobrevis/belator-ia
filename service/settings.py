@@ -240,8 +240,8 @@ def load_settings() -> ServiceSettings:
             os.environ.get("PYRONE_PROCESSED_RTSP_PRESET", "veryfast"),
         ),
         processed_rtsp_write_timeout_seconds=max(
-            1.0,
-            _read_float("PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS", 3.0),
+            8.0,
+            _read_float("PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS", 8.0),
         ),
         processed_publish_startup_timeout_seconds=min(
             max(

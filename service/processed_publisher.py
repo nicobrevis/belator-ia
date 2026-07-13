@@ -11,6 +11,7 @@ from service.latest_frame_queue import CapturedFrame, LatestFrameQueue
 
 
 PUBLISHER_PROCESS_MARKER = "comment=pyrone-processed-publisher"
+MIN_OPERATIONAL_WRITE_TIMEOUT_SECONDS = 8.0
 
 
 _ALLOWED_PRESETS = {
@@ -202,7 +203,10 @@ class FfmpegFramePublisher:
         self.width = int(width)
         self.height = int(height)
         self.fps = min(max(float(fps or 1.0), 1.0), 30.0)
-        self.write_timeout_seconds = max(1.0, float(write_timeout_seconds or 3.0))
+        self.write_timeout_seconds = max(
+            MIN_OPERATIONAL_WRITE_TIMEOUT_SECONDS,
+            float(write_timeout_seconds or MIN_OPERATIONAL_WRITE_TIMEOUT_SECONDS),
+        )
         self.startup_timeout_seconds = min(
             max(float(startup_timeout_seconds or 25.0), 15.0),
             30.0,
@@ -308,13 +312,11 @@ class FfmpegFramePublisher:
         with self._lock:
             first_write_at = self._first_write_at
             last_write_at = self._last_write_at
-            last_input_at = self._last_input_at
-        if not first_write_at or not last_write_at or not last_input_at:
+        if not first_write_at or not last_write_at:
             return False
         return (
             now - first_write_at >= self.ready_after_seconds
             and now - last_write_at <= self.ready_freshness_seconds
-            and now - last_input_at <= self.ready_freshness_seconds
         )
 
     @property
@@ -421,11 +423,9 @@ class FfmpegFramePublisher:
             if now < next_write_at:
                 continue
 
-            with self._lock:
-                last_input_at = self._last_input_at
-            if last_input_at and now - last_input_at > self.stale_frame_seconds:
-                self._mark_failed("processed publisher input became stale")
-                return
+            # A temporary inference pause must not tear down MediaMTX readers.
+            # Keep the last complete frame flowing at CFR; DroneWorker owns source
+            # liveness and explicitly releases this publisher when ingest closes.
 
             if not self._write_payload(latest.value):
                 return
@@ -436,7 +436,8 @@ class FfmpegFramePublisher:
     def _write_payload(self, payload: bytes) -> bool:
         process = self._process
         if not process or not process.stdin or process.poll() is not None:
-            self._mark_failed("processed publisher process stopped")
+            if not self._stop_event.is_set():
+                self._mark_failed("processed publisher process stopped")
             return False
 
         try:
@@ -457,7 +458,8 @@ class FfmpegFramePublisher:
                 self._last_write_at = write_completed_at
             return True
         except (BrokenPipeError, OSError, ValueError) as error:
-            self._mark_failed(str(error))
+            if not self._stop_event.is_set():
+                self._mark_failed(str(error))
             return False
         finally:
             with self._lock:
@@ -492,6 +494,10 @@ class FfmpegFramePublisher:
                 return
             self._failed = True
             self._last_error = detail
+        print(
+            f"[processed-publisher] output={self.safe_output_url} failed: {detail}",
+            flush=True,
+        )
 
     def release(self) -> None:
         process = self._process

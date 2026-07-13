@@ -462,6 +462,9 @@ class DroneWorkerProcess:
                 )
             ),
             "processedPublisherError": "",
+            "processedPublisherLastFailureReason": "",
+            "processedPublisherLastFailureAt": "",
+            "processedPublisherFailureCount": 0,
             "processedPublisherRestartCount": 0,
             "processedPublisherFramesWritten": 0,
             "processedPublisherDroppedFrames": 0,

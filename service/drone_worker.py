@@ -464,6 +464,9 @@ class DroneWorker:
             "processedPublisherTransport": self.settings.processed_publish_transport,
             "processedPublisherUrl": "",
             "processedPublisherError": "",
+            "processedPublisherLastFailureReason": "",
+            "processedPublisherLastFailureAt": "",
+            "processedPublisherFailureCount": 0,
             "processedPublisherRestartCount": 0,
             "processedPublisherFramesWritten": 0,
             "processedPublisherDroppedFrames": 0,
@@ -1771,6 +1774,7 @@ class DroneWorker:
 
         if publisher and not publisher.is_running():
             error = publisher.last_error or "processed publisher stopped"
+            self._record_processed_publisher_failure(error)
             self._stop_processed_publisher(reset_retry=False)
             self._schedule_publisher_retry(now)
             self._set_runtime(processedPublisherError=error)
@@ -1811,13 +1815,15 @@ class DroneWorker:
                     stale_frame_seconds=self.settings.processed_publish_stale_seconds,
                 )
             except (OSError, ValueError, subprocess.SubprocessError) as error:
+                safe_error = str(error).replace(output_url, safe_output_url)
+                self._record_processed_publisher_failure(safe_error)
                 self._schedule_publisher_retry(now)
                 self._set_runtime(
                     processedStreamReady=False,
                     processedStreamUrl=fallback_url,
                     processedPublisherPid=None,
                     processedPublisherUrl=safe_output_url,
-                    processedPublisherError=str(error),
+                    processedPublisherError=safe_error,
                 )
                 return
 
@@ -1830,6 +1836,7 @@ class DroneWorker:
         accepted = publisher.write(payload)
         if not accepted:
             error = publisher.last_error or "processed publisher rejected a frame"
+            self._record_processed_publisher_failure(error)
             self._stop_processed_publisher(reset_retry=False)
             self._schedule_publisher_retry(now)
             self._set_runtime(processedPublisherError=error)
@@ -1837,6 +1844,7 @@ class DroneWorker:
 
         if not publisher.is_running():
             error = publisher.last_error or "processed publisher stopped during startup"
+            self._record_processed_publisher_failure(error)
             self._stop_processed_publisher(reset_retry=False)
             self._schedule_publisher_retry(now)
             self._set_runtime(processedPublisherError=error)
@@ -1888,6 +1896,25 @@ class DroneWorker:
             return
         self._processed_publisher_retry_delay = self.settings.processed_publish_retry_seconds
         self._processed_publisher_next_retry_at = 0.0
+
+    def _record_processed_publisher_failure(self, reason: str) -> None:
+        normalized_reason = " ".join(str(reason or "processed publisher failed").split())[-1000:]
+        failed_at = utc_now()
+        with self._lock:
+            failure_count = int(self._runtime.get("processedPublisherFailureCount") or 0) + 1
+            self._runtime.update(
+                {
+                    "processedPublisherLastFailureReason": normalized_reason,
+                    "processedPublisherLastFailureAt": failed_at,
+                    "processedPublisherFailureCount": failure_count,
+                }
+            )
+        print(
+            f"[drone-worker] processed publisher failure "
+            f"drone={self.pipeline_id} count={failure_count} at={failed_at}: "
+            f"{normalized_reason}",
+            flush=True,
+        )
 
     def _stop_processed_publisher(self, *, reset_retry: bool = True) -> None:
         publisher = self._processed_publisher
