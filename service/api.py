@@ -118,10 +118,21 @@ class AnalyticsServiceApp:
                 return self._send_json(handler, {"error": "pipeline not found"}, status=404)
             return self._send_json(handler, {"ok": True, "pipeline": pipeline})
 
+        detections_latest_match = re.fullmatch(r"/v1/pipelines/([^/]+)/detections/latest", path)
+        if detections_latest_match:
+            if handler.command != "GET":
+                return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            detections = self.pipeline_manager.latest_detections(detections_latest_match.group(1))
+            if detections is None:
+                return self._send_json(handler, {"error": "pipeline not found"}, status=404)
+            return self._send_json(handler, detections)
+
         frame_match = re.fullmatch(r"/v1/pipelines/([^/]+)/frame\.jpg", path)
         if frame_match:
             if handler.command != "GET":
                 return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            if not self.settings.legacy_mjpeg_enabled:
+                return self._send_json(handler, {"error": "legacy MJPEG is disabled"}, status=404)
             frame = self.pipeline_manager.latest_processed_frame(frame_match.group(1))
             if frame is None:
                 return self._send_json(handler, {"error": "frame not available"}, status=404)
@@ -131,6 +142,8 @@ class AnalyticsServiceApp:
         if frame_raw_match:
             if handler.command != "GET":
                 return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            if not self.settings.legacy_mjpeg_enabled:
+                return self._send_json(handler, {"error": "legacy MJPEG is disabled"}, status=404)
             frame = self.pipeline_manager.latest_raw_frame(frame_raw_match.group(1))
             if frame is None:
                 return self._send_json(handler, {"error": "frame not available"}, status=404)
@@ -140,12 +153,16 @@ class AnalyticsServiceApp:
         if mjpeg_match:
             if handler.command != "GET":
                 return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            if not self.settings.legacy_mjpeg_enabled:
+                return self._send_json(handler, {"error": "legacy MJPEG is disabled"}, status=404)
             return self._stream_mjpeg(handler, mjpeg_match.group(1), variant="processed")
 
         mjpeg_raw_match = re.fullmatch(r"/v1/pipelines/([^/]+)/stream\.raw\.mjpg", path)
         if mjpeg_raw_match:
             if handler.command != "GET":
                 return self._send_json(handler, {"error": "method not allowed"}, status=405)
+            if not self.settings.legacy_mjpeg_enabled:
+                return self._send_json(handler, {"error": "legacy MJPEG is disabled"}, status=404)
             return self._stream_mjpeg(handler, mjpeg_raw_match.group(1), variant="raw")
 
         if path == "/v1/recordings" and handler.command == "GET":
@@ -408,22 +425,61 @@ class AnalyticsServiceApp:
         handler.send_header("Connection", "close")
         handler.end_headers()
 
+        last_sent_at = time.monotonic()
+        stale_timeout = self._mjpeg_stale_timeout_seconds()
+        buffer_delay = self._mjpeg_buffer_seconds()
+        last_sent_sequence = 0
+
         try:
             while True:
-                frame = self._latest_frame_for_variant(drone_id, variant=variant)
+                pipeline = self.pipeline_manager.get_pipeline(drone_id)
+                if pipeline is None:
+                    return
+
+                frame = None
+                if buffer_delay > 0:
+                    buffered = self.pipeline_manager.buffered_frames(
+                        drone_id,
+                        variant=variant,
+                        delay_seconds=buffer_delay,
+                        after_seq=last_sent_sequence,
+                        limit=1,
+                    )
+                    if buffered:
+                        last_sent_sequence, frame = buffered[0]
+                else:
+                    frame = self._latest_frame_for_variant(drone_id, variant=variant)
+
                 if frame:
-                    header = (
-                        f"--{boundary}\r\n"
-                        "Content-Type: image/jpeg\r\n"
-                        f"Content-Length: {len(frame)}\r\n\r\n"
-                    ).encode("utf-8")
-                    handler.wfile.write(header)
-                    handler.wfile.write(frame)
-                    handler.wfile.write(b"\r\n")
-                    handler.wfile.flush()
+                    self._write_mjpeg_frame(handler, boundary, frame)
+                    last_sent_at = time.monotonic()
+                elif time.monotonic() - last_sent_at >= stale_timeout:
+                    return
                 time.sleep(frame_interval)
         except (BrokenPipeError, ConnectionResetError):
             return
+
+    @staticmethod
+    def _write_mjpeg_frame(handler: BaseHTTPRequestHandler, boundary: str, frame: bytes) -> None:
+        header = (
+            f"--{boundary}\r\n"
+            "Content-Type: image/jpeg\r\n"
+            f"Content-Length: {len(frame)}\r\n\r\n"
+        ).encode("utf-8")
+        handler.wfile.write(header)
+        handler.wfile.write(frame)
+        handler.wfile.write(b"\r\n")
+        handler.wfile.flush()
+
+    def _mjpeg_buffer_seconds(self) -> float:
+        return max(0.0, float(self.settings.mjpeg_buffer_seconds))
+
+    def _mjpeg_stale_timeout_seconds(self) -> float:
+        return max(
+            self.settings.rtsp_read_timeout_seconds * 3.0,
+            self.settings.reconnect_delay_seconds * 4.0,
+            self._mjpeg_buffer_seconds() + 12.0,
+        )
 
     def _frame_interval_for_pipeline(self, pipeline: dict[str, object]) -> float:
         runtime = pipeline.get("runtime") if isinstance(pipeline.get("runtime"), dict) else {}

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -12,13 +12,22 @@ from typing import Any
 
 from service.schemas import utc_now
 from service.settings import ServiceSettings
+from service.processed_publisher import sanitize_stream_url
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f"{path.name}.tmp")
-    tmp_path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
+    try:
+        tmp_path.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -34,6 +43,30 @@ def _read_bytes(path: Path) -> bytes | None:
         return path.read_bytes()
     except OSError:
         return None
+
+
+def _safe_int(value: object, fallback = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _safe_float(value: object, fallback = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _timestamp_to_epoch(value: object) -> float:
+    if not isinstance(value, str) or not value.strip():
+        return 0.0
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _processes() -> list[tuple[int, list[str]]]:
@@ -116,13 +149,17 @@ class DroneWorkerProcess:
         self.runtime_path = self.worker_dir / "runtime.json"
         self.processed_frame_path = self.worker_dir / "processed.jpg"
         self.raw_frame_path = self.worker_dir / "raw.jpg"
+        self.detections_path = self.worker_dir / "detections.latest.json"
+        self.buffer_dir = self.worker_dir / "buffer"
         self.pid_path = self.worker_dir / "worker.pid"
         self.log_path = self.worker_dir / "worker.log"
         self._process: subprocess.Popen[bytes] | None = None
         self._started_at = ""
 
     def start(self) -> None:
-        if self.is_running():
+        running_pid = self.pid if self.is_running() else None
+        if running_pid:
+            self._stop_duplicate_processes(keep_pid=running_pid)
             return
 
         self.worker_dir.mkdir(parents=True, exist_ok=True)
@@ -193,7 +230,10 @@ class DroneWorkerProcess:
     def update_pipeline(self, pipeline: dict[str, object]) -> None:
         self._pipeline = dict(pipeline)
         self._write_pipeline()
-        if not self.is_running():
+        running_pid = self.pid if self.is_running() else None
+        if running_pid:
+            self._stop_duplicate_processes(keep_pid=running_pid)
+        else:
             self.start()
 
     def runtime_snapshot(self) -> dict[str, object]:
@@ -225,10 +265,115 @@ class DroneWorkerProcess:
         return runtime
 
     def latest_processed_frame(self) -> bytes | None:
-        return _read_bytes(self.processed_frame_path)
+        if not self.settings.legacy_mjpeg_enabled:
+            return None
+        return self._read_fresh_frame(
+            self.processed_frame_path,
+            available_key="latestProcessedFrameAvailable",
+        )
 
     def latest_raw_frame(self) -> bytes | None:
-        return _read_bytes(self.raw_frame_path)
+        if not self.settings.legacy_mjpeg_enabled:
+            return None
+        return self._read_fresh_frame(
+            self.raw_frame_path,
+            available_key="latestRawFrameAvailable",
+        )
+
+    def latest_detections(self) -> dict[str, object]:
+        if not self.is_running():
+            return self._empty_detections()
+
+        runtime = self._runtime_with_defaults()
+        if not runtime.get("sourceOpened") or str(runtime.get("status") or "") not in {"running", "starting"}:
+            return self._empty_detections(runtime=runtime)
+
+        payload = _read_json(self.detections_path)
+        if not payload:
+            return self._empty_detections(runtime=runtime)
+
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        frame_at = str(payload.get("frameAt") or "")
+        last_frame_at = str(runtime.get("lastFrameAt") or "")
+        stale_after = max(
+            self.settings.rtsp_read_timeout_seconds * 3.0,
+            self.settings.reconnect_delay_seconds * 4.0,
+            12.0,
+        )
+        frame_epoch = _timestamp_to_epoch(frame_at or last_frame_at)
+        if frame_epoch and time.time() - frame_epoch > stale_after:
+            return self._empty_detections(runtime=runtime)
+
+        return {
+            "droneId": self.drone_id,
+            "frameAt": frame_at,
+            "modelId": str(payload.get("modelId") or runtime.get("modelId") or ""),
+            "modelName": str(payload.get("modelName") or runtime.get("modelName") or ""),
+            "sensorType": str(payload.get("sensorType") or self._pipeline.get("sensorType") or "unknown"),
+            "frameWidth": payload.get("frameWidth"),
+            "frameHeight": payload.get("frameHeight"),
+            "items": [item for item in items if isinstance(item, dict)],
+        }
+
+    def buffered_frames(
+        self,
+        *,
+        variant: str,
+        delay_seconds: float,
+        after_seq: int = 0,
+        limit: int = 4,
+    ) -> list[tuple[int, bytes]]:
+        if not self.settings.legacy_mjpeg_enabled:
+            return []
+        if not self.is_running():
+            return []
+
+        runtime = self._runtime_with_defaults()
+        if not runtime.get("sourceOpened") or str(runtime.get("status") or "") not in {"running", "starting"}:
+            return []
+
+        stale_after = max(
+            self.settings.rtsp_read_timeout_seconds * 3.0,
+            self.settings.reconnect_delay_seconds * 4.0,
+            12.0,
+        )
+        last_frame_epoch = _timestamp_to_epoch(runtime.get("lastFrameAt"))
+        if last_frame_epoch and time.time() - last_frame_epoch > stale_after:
+            return []
+
+        manifest = _read_json(self.buffer_dir / f"{variant}.json")
+        raw_items = manifest.get("items") if isinstance(manifest.get("items"), list) else []
+        cutoff = time.time() - max(0.0, delay_seconds)
+        entries = [
+            item
+            for item in raw_items
+            if isinstance(item, dict)
+            and _safe_float(item.get("createdAt")) <= cutoff
+        ]
+        entries.sort(key=lambda item: _safe_int(item.get("seq")))
+
+        if after_seq and entries and _safe_int(entries[-1].get("seq")) <= after_seq:
+            after_seq = 0
+
+        frames: list[tuple[int, bytes]] = []
+        for item in entries:
+            sequence = _safe_int(item.get("seq"))
+            if after_seq and sequence <= after_seq:
+                continue
+
+            relative_path = str(item.get("file") or "")
+            if not relative_path or relative_path.startswith("/") or ".." in Path(relative_path).parts:
+                continue
+
+            frame = _read_bytes(self.buffer_dir / relative_path)
+            if not frame:
+                continue
+
+            frames.append((sequence, frame))
+            if len(frames) >= max(1, limit):
+                break
+
+        return frames
 
     @property
     def pid(self) -> int | None:
@@ -251,7 +396,7 @@ class DroneWorkerProcess:
     def _write_runtime_overlay(self, overlay: dict[str, object]) -> None:
         runtime = self._runtime_with_defaults()
         runtime.update(overlay)
-        runtime["workerProcessUpdatedAt"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        runtime["workerProcessUpdatedAt"] = utc_now()
         _write_json_atomic(self.runtime_path, runtime)
 
     def _runtime_with_defaults(self) -> dict[str, object]:
@@ -277,6 +422,14 @@ class DroneWorkerProcess:
             "frameHeight": None,
             "sourceFps": None,
             "processingFps": 0.0,
+            "framesCaptured": 0,
+            "framesDroppedBeforeInference": 0,
+            "captureQueueCapacity": 1,
+            "captureQueueDepth": 0,
+            "lastCapturedFrameAt": "",
+            "lastInferenceFrameAgeMs": None,
+            "avgInferenceFrameAgeMs": None,
+            "maxInferenceFrameAgeMs": None,
             "framesProcessed": 0,
             "detectionsTotal": 0,
             "avgInferenceMs": None,
@@ -286,13 +439,35 @@ class DroneWorkerProcess:
             "lastRecording": None,
             "latestFrameAvailable": False,
             "latestFrameContentType": "image/jpeg",
-            "latestProcessedFrameAvailable": self.processed_frame_path.exists(),
+            "latestProcessedFrameAvailable": (
+                self.settings.legacy_mjpeg_enabled and self.processed_frame_path.exists()
+            ),
             "latestProcessedFrameContentType": "image/jpeg",
-            "latestRawFrameAvailable": self.raw_frame_path.exists(),
+            "latestRawFrameAvailable": (
+                self.settings.legacy_mjpeg_enabled and self.raw_frame_path.exists()
+            ),
             "latestRawFrameContentType": "image/jpeg",
             "processedStreamReady": False,
-            "processedStreamUrl": self.settings.processed_publish_url(self.drone_id),
+            "processedStreamUrl": (
+                f"/v1/pipelines/{self.drone_id}/stream.mjpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
             "processedPublisherPid": None,
+            "processedPublisherTransport": self.settings.processed_publish_transport,
+            "processedPublisherUrl": sanitize_stream_url(
+                self.settings.processed_publish_url(
+                    self.drone_id,
+                    str(self._pipeline.get("rtspUrl") or ""),
+                )
+            ),
+            "processedPublisherError": "",
+            "processedPublisherRestartCount": 0,
+            "processedPublisherFramesWritten": 0,
+            "processedPublisherDroppedFrames": 0,
+            "processedPublisherStable": False,
+            "processedPublisherUptimeSeconds": 0.0,
+            "legacyMjpegEnabled": self.settings.legacy_mjpeg_enabled,
             "processedStreamRevision": 0,
             "processedStreamStartedAt": "",
             "modelId": str(self._pipeline.get("currentModelId") or ""),
@@ -301,7 +476,7 @@ class DroneWorkerProcess:
         return {**defaults, **runtime}
 
     def _clear_transient_files(self) -> None:
-        for path in (self.processed_frame_path, self.raw_frame_path):
+        for path in (self.processed_frame_path, self.raw_frame_path, self.detections_path):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -309,11 +484,59 @@ class DroneWorkerProcess:
             except OSError:
                 continue
 
-    def _stop_duplicate_processes(self) -> None:
+    def _empty_detections(self, *, runtime: dict[str, object] | None = None) -> dict[str, object]:
+        runtime = runtime or self._runtime_with_defaults()
+        return {
+            "droneId": self.drone_id,
+            "frameAt": str(runtime.get("lastFrameAt") or ""),
+            "modelId": str(runtime.get("modelId") or self._pipeline.get("currentModelId") or ""),
+            "modelName": str(runtime.get("modelName") or ""),
+            "sensorType": str(self._pipeline.get("sensorType") or "unknown"),
+            "frameWidth": runtime.get("frameWidth"),
+            "frameHeight": runtime.get("frameHeight"),
+            "items": [],
+        }
+
+    def _read_fresh_frame(self, path: Path, *, available_key: str) -> bytes | None:
+        if not self.is_running():
+            return None
+
+        runtime = self._runtime_with_defaults()
+        if not runtime.get(available_key):
+            return None
+
+        if not runtime.get("sourceOpened"):
+            return None
+
+        status = str(runtime.get("status") or "")
+        if status not in {"running", "starting"}:
+            return None
+
+        stale_after = max(
+            self.settings.rtsp_read_timeout_seconds * 3.0,
+            self.settings.reconnect_delay_seconds * 4.0,
+            12.0,
+        )
+        last_frame_epoch = _timestamp_to_epoch(runtime.get("lastFrameAt"))
+
+        if last_frame_epoch and time.time() - last_frame_epoch > stale_after:
+            return None
+
+        try:
+            frame_mtime = path.stat().st_mtime
+        except OSError:
+            return None
+
+        if not last_frame_epoch and time.time() - frame_mtime > stale_after:
+            return None
+
+        return _read_bytes(path)
+
+    def _stop_duplicate_processes(self, *, keep_pid: int | None = None) -> None:
         worker_dir_token = str(self.worker_dir)
         drone_token = self.drone_id
         for pid, command in _processes():
-            if pid == os.getpid():
+            if pid == os.getpid() or (keep_pid is not None and pid == keep_pid):
                 continue
             if "service.worker_main" not in command:
                 continue
