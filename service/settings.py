@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
+
+from service.processed_publisher import normalize_publisher_bitrate, normalize_publisher_preset
 
 SERVICE_DIR = Path(__file__).resolve().parent
 REPO_DIR = SERVICE_DIR.parent
@@ -53,11 +55,20 @@ class ServiceSettings:
     processed_publish_transport: str
     processed_whip_url_template: str
     processed_rtmp_url_template: str
+    processed_rtmp_port: int
     processed_rtsp_enabled: bool
     processed_rtsp_bitrate: str
     processed_rtsp_bufsize: str
     processed_rtsp_preset: str
     processed_rtsp_write_timeout_seconds: float
+    processed_publish_startup_timeout_seconds: float
+    processed_publish_ready_after_seconds: float
+    processed_publish_ready_freshness_seconds: float
+    processed_publish_stable_reset_seconds: float
+    processed_publish_max_fps: float
+    processed_publish_retry_seconds: float
+    processed_publish_retry_max_seconds: float
+    processed_publish_stale_seconds: float
     storage_high_watermark: float
     storage_low_watermark: float
     ffmpeg_path: str
@@ -84,8 +95,9 @@ class ServiceSettings:
     preview_jpeg_quality: int
     max_frame_width: int
     mjpeg_buffer_seconds: float
+    legacy_mjpeg_enabled: bool
 
-    def processed_stream_url(self, drone_id: str) -> str:
+    def processed_stream_url(self, drone_id: str, source_url: str = "") -> str:
         safe_id = quote(str(drone_id).strip(), safe="")
         if self.processed_rtsp_url_template:
             return self.processed_rtsp_url_template.replace("{droneId}", safe_id).replace(
@@ -93,9 +105,11 @@ class ServiceSettings:
                 safe_id,
             )
 
-        return f"rtsp://{self.processed_rtsp_host}:{self.processed_rtsp_port}/processed/{safe_id}"
+        source_host = self._mediamtx_source_host(source_url)
+        host = source_host or self.processed_rtsp_host
+        return f"rtsp://{self._url_host(host)}:{self.processed_rtsp_port}/processed/{safe_id}"
 
-    def processed_publish_url(self, drone_id: str) -> str:
+    def processed_publish_url(self, drone_id: str, source_url: str = "") -> str:
         safe_id = quote(str(drone_id).strip(), safe="")
 
         if self.processed_publish_transport == "whip":
@@ -103,10 +117,35 @@ class ServiceSettings:
             return template.replace("{droneId}", safe_id).replace("{streamKey}", safe_id)
 
         if self.processed_publish_transport == "rtmp":
-            template = self.processed_rtmp_url_template or "rtmp://127.0.0.1:1935/processed/{droneId}"
-            return template.replace("{droneId}", safe_id).replace("{streamKey}", safe_id)
+            if self.processed_rtmp_url_template:
+                return self.processed_rtmp_url_template.replace("{droneId}", safe_id).replace(
+                    "{streamKey}", safe_id
+                )
+            source_host = self._mediamtx_source_host(source_url)
+            if not source_host:
+                return ""
+            return f"rtmp://{self._url_host(source_host)}:{self.processed_rtmp_port}/processed/{safe_id}"
 
-        return self.processed_stream_url(drone_id)
+        return self.processed_stream_url(drone_id, source_url)
+
+    @staticmethod
+    def _url_host(host: str) -> str:
+        return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+    @staticmethod
+    def _mediamtx_source_host(source_url: str) -> str:
+        """Derive a publish host only from the MediaMTX ingest path shapes we own."""
+
+        try:
+            parsed = urlsplit(str(source_url or "").strip())
+        except ValueError:
+            return ""
+        if parsed.scheme.lower() not in {"rtsp", "rtsps"} or not parsed.hostname:
+            return ""
+        normalized_path = parsed.path.rstrip("/").lower()
+        if not normalized_path.startswith(("/live/", "/web/")):
+            return ""
+        return parsed.hostname
 
 
 def ensure_directories(settings: ServiceSettings) -> None:
@@ -139,8 +178,20 @@ def load_settings() -> ServiceSettings:
         "rtmp",
     ).strip().lower()
 
-    if processed_publish_transport not in {"rtmp", "rtsp", "whip"}:
+    if processed_publish_transport not in {"rtmp", "rtsp"}:
         processed_publish_transport = "rtmp"
+
+    publish_retry_seconds = min(
+        max(_read_float("PYRONE_PROCESSED_PUBLISH_RETRY_SECONDS", 2.0), 0.5),
+        60.0,
+    )
+    publish_retry_max_seconds = min(
+        max(
+            _read_float("PYRONE_PROCESSED_PUBLISH_RETRY_MAX_SECONDS", 30.0),
+            publish_retry_seconds,
+        ),
+        300.0,
+    )
 
     settings = ServiceSettings(
         repo_dir=REPO_DIR,
@@ -173,18 +224,59 @@ def load_settings() -> ServiceSettings:
         ).strip(),
         processed_rtmp_url_template=os.environ.get(
             "PYRONE_PROCESSED_RTMP_URL_TEMPLATE",
-            "rtmp://127.0.0.1:1935/processed/{droneId}",
+            "",
         ).strip(),
+        processed_rtmp_port=min(max(_read_int("PYRONE_PROCESSED_RTMP_PORT", 1935), 1), 65535),
         processed_rtsp_enabled=_read_bool("PYRONE_PROCESSED_RTSP_ENABLED", True),
-        processed_rtsp_bitrate=os.environ.get("PYRONE_PROCESSED_RTSP_BITRATE", "2500k").strip()
-        or "2500k",
-        processed_rtsp_bufsize=os.environ.get("PYRONE_PROCESSED_RTSP_BUFSIZE", "5000k").strip()
-        or "5000k",
-        processed_rtsp_preset=os.environ.get("PYRONE_PROCESSED_RTSP_PRESET", "veryfast").strip()
-        or "veryfast",
+        processed_rtsp_bitrate=normalize_publisher_bitrate(
+            os.environ.get("PYRONE_PROCESSED_RTSP_BITRATE", "2500k"),
+            "2500k",
+        ),
+        processed_rtsp_bufsize=normalize_publisher_bitrate(
+            os.environ.get("PYRONE_PROCESSED_RTSP_BUFSIZE", "5000k"),
+            "5000k",
+        ),
+        processed_rtsp_preset=normalize_publisher_preset(
+            os.environ.get("PYRONE_PROCESSED_RTSP_PRESET", "veryfast"),
+        ),
         processed_rtsp_write_timeout_seconds=max(
             1.0,
             _read_float("PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS", 3.0),
+        ),
+        processed_publish_startup_timeout_seconds=min(
+            max(
+                _read_float("PYRONE_PROCESSED_PUBLISH_STARTUP_TIMEOUT_SECONDS", 25.0),
+                15.0,
+            ),
+            30.0,
+        ),
+        processed_publish_ready_after_seconds=min(
+            max(_read_float("PYRONE_PROCESSED_PUBLISH_READY_AFTER_SECONDS", 2.0), 0.5),
+            10.0,
+        ),
+        processed_publish_ready_freshness_seconds=min(
+            max(
+                _read_float("PYRONE_PROCESSED_PUBLISH_READY_FRESHNESS_SECONDS", 2.0),
+                0.5,
+            ),
+            10.0,
+        ),
+        processed_publish_stable_reset_seconds=min(
+            max(
+                _read_float("PYRONE_PROCESSED_PUBLISH_STABLE_RESET_SECONDS", 20.0),
+                5.0,
+            ),
+            120.0,
+        ),
+        processed_publish_max_fps=min(
+            max(_read_float("PYRONE_PROCESSED_PUBLISH_MAX_FPS", 20.0), 1.0),
+            30.0,
+        ),
+        processed_publish_retry_seconds=publish_retry_seconds,
+        processed_publish_retry_max_seconds=publish_retry_max_seconds,
+        processed_publish_stale_seconds=max(
+            3.0,
+            _read_float("PYRONE_PROCESSED_PUBLISH_STALE_SECONDS", 8.0),
         ),
         storage_high_watermark=storage_high_watermark,
         storage_low_watermark=storage_low_watermark,
@@ -245,6 +337,7 @@ def load_settings() -> ServiceSettings:
             max(_read_float("PYRONE_MJPEG_BUFFER_SECONDS", 1.0), 0.0),
             10.0,
         ),
+        legacy_mjpeg_enabled=_read_bool("PYRONE_LEGACY_MJPEG_ENABLED", True),
     )
     ensure_directories(settings)
     return settings

@@ -33,6 +33,45 @@ Endpoints utiles del servicio:
 - `GET /v1/pipelines/<droneId>/stream.mjpg`
 - `GET /v1/recordings?droneId=<droneId>`
 
+### Publicacion de video procesado
+
+Cada worker conserva los endpoints JPEG/MJPEG anteriores y, en paralelo, puede
+publicar el video anotado como H.264 de baja latencia en MediaMTX. El unit
+versionado contiene el destino VPN actual sin credenciales; cualquier secreto o
+destino alternativo se configura en `/etc/pyrone/analytics.env`:
+
+```bash
+PYRONE_PROCESSED_PUBLISH_TRANSPORT=rtmp
+PYRONE_PROCESSED_RTMP_URL_TEMPLATE=rtmp://<mediamtx-vpn>:1935/processed/{droneId}
+```
+
+El unit de systemd carga opcionalmente `/etc/pyrone/analytics.env`; este es el
+lugar recomendado para esas variables. Si la URL no esta configurada, MediaMTX
+no responde o FFmpeg debe reconectarse, `stream.mjpg` sigue disponible como
+fallback. El worker reintenta la publicacion con backoff y nunca expone la
+contrasena de una URL en su estado de runtime.
+
+El handshake inicial usa un timeout separado de 25 segundos. Una vez establecida
+la salida, cada escritura tiene un timeout de 3 segundos. La salida solo pasa a
+`ready` tras 2 segundos con proceso vivo y frames frescos; el backoff acumulado
+se reinicia unicamente despues de 20 segundos de estabilidad sostenida. Estos
+umbrales se controlan con `PYRONE_PROCESSED_PUBLISH_STARTUP_TIMEOUT_SECONDS`,
+`PYRONE_PROCESSED_RTSP_WRITE_TIMEOUT_SECONDS`,
+`PYRONE_PROCESSED_PUBLISH_READY_AFTER_SECONDS`,
+`PYRONE_PROCESSED_PUBLISH_READY_FRESHNESS_SECONDS` y
+`PYRONE_PROCESSED_PUBLISH_STABLE_RESET_SECONDS`.
+
+Durante la transicion, `PYRONE_LEGACY_MJPEG_ENABLED=true` (valor por defecto)
+mantiene los JPEG, buffers y endpoints MJPEG. Solo despues de validar RTMP se
+puede cambiar a `false`: en ese modo no se generan esos artefactos ni se sirven
+sus endpoints, pero detecciones, runtime, grabaciones y RTMP siguen operativos.
+
+La captura y la inferencia estan desacopladas mediante una cola de un solo frame.
+Asi, cuando el modelo va mas lento que el video, se conserva el frame mas nuevo
+en vez de acumular retraso. El runtime expone `framesCaptured`,
+`framesDroppedBeforeInference`, `lastInferenceFrameAgeMs` y
+`avgInferenceFrameAgeMs` para observar ese comportamiento.
+
 ### Segunda etapa de clasificacion
 
 El servicio puede usar un clasificador YOLOv8s adicional para validar detecciones

@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+service/runtime/
 
 .DS_Store
 Thumbs.db

@@ -52,7 +52,10 @@ class PipelineManager:
             "cameraMode": previous.get("cameraMode") if previous else "",
             "sensorType": sensor_type,
             "currentModelId": current_model_id,
-            "processedRtspUrl": self.settings.processed_stream_url(str(pipeline["droneId"])),
+            "processedRtspUrl": self.settings.processed_stream_url(
+                str(pipeline["droneId"]),
+                str(pipeline.get("rtspUrl") or ""),
+            ),
             "status": self._status_for_pipeline(pipeline, previous),
         }
         restart_required = self._worker_restart_required(previous, next_pipeline)
@@ -72,6 +75,7 @@ class PipelineManager:
             return None
         self._stop_worker(str(drone_id or "").strip())
         self._persist()
+        self._cleanup_orphaned_publishers()
         return self._copy_pipeline(pipeline)
 
     def restart_pipeline(self, drone_id: str) -> dict[str, object]:
@@ -198,7 +202,10 @@ class PipelineManager:
             pipeline["cameraMode"] = str(item.get("cameraMode") or "")
             pipeline["sensorType"] = str(item.get("sensorType") or "unknown")
             pipeline["currentModelId"] = self._select_model_id(pipeline, str(pipeline["sensorType"]))
-            pipeline["processedRtspUrl"] = self.settings.processed_stream_url(drone_id)
+            pipeline["processedRtspUrl"] = self.settings.processed_stream_url(
+                drone_id,
+                str(pipeline.get("rtspUrl") or ""),
+            )
             pipeline["sourceOnline"] = bool(item.get("sourceOnline", True))
             pipeline["status"] = self._status_for_pipeline(pipeline, item)
             self._pipelines[drone_id] = pipeline
@@ -237,6 +244,7 @@ class PipelineManager:
                     "autoModelMap": dict(pipeline.get("autoModelMap", {})),
                     "confidenceThreshold": pipeline["confidenceThreshold"],
                     "processingFps": pipeline["processingFps"],
+                    "secondStageEnabled": pipeline["secondStageEnabled"],
                     "recordOnEvent": pipeline["recordOnEvent"],
                     "recordingSegmentMode": pipeline["recordingSegmentMode"],
                     "recordingSegmentMinutes": pipeline["recordingSegmentMinutes"],
@@ -259,11 +267,28 @@ class PipelineManager:
         public = {
             **pipeline,
             "autoModelMap": dict(pipeline.get("autoModelMap", {})),
-            "latestFramePath": f"/v1/pipelines/{pipeline['droneId']}/frame.jpg",
-            "mjpegStreamPath": f"/v1/pipelines/{pipeline['droneId']}/stream.mjpg",
-            "latestRawFramePath": f"/v1/pipelines/{pipeline['droneId']}/frame.raw.jpg",
-            "rawMjpegStreamPath": f"/v1/pipelines/{pipeline['droneId']}/stream.raw.mjpg",
+            "latestFramePath": (
+                f"/v1/pipelines/{pipeline['droneId']}/frame.jpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
+            "mjpegStreamPath": (
+                f"/v1/pipelines/{pipeline['droneId']}/stream.mjpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
+            "latestRawFramePath": (
+                f"/v1/pipelines/{pipeline['droneId']}/frame.raw.jpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
+            "rawMjpegStreamPath": (
+                f"/v1/pipelines/{pipeline['droneId']}/stream.raw.mjpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
             "processedStreamReady": False,
+            "legacyMjpegEnabled": self.settings.legacy_mjpeg_enabled,
         }
         worker = self._workers.get(str(pipeline["droneId"]))
         if worker:
@@ -289,12 +314,33 @@ class PipelineManager:
                 "lastSourceOpenAt": "",
                 "lastSourceCloseAt": "",
                 "lastSourceError": "",
+                "framesCaptured": 0,
+                "framesDroppedBeforeInference": 0,
+                "captureQueueCapacity": 1,
+                "captureQueueDepth": 0,
+                "lastCapturedFrameAt": "",
+                "lastInferenceFrameAgeMs": None,
+                "avgInferenceFrameAgeMs": None,
+                "maxInferenceFrameAgeMs": None,
                 "latestFrameAvailable": False,
                 "latestProcessedFrameAvailable": False,
                 "latestRawFrameAvailable": False,
                 "processedStreamReady": False,
-                "processedStreamUrl": str(pipeline.get("processedRtspUrl") or ""),
+                "processedStreamUrl": (
+                    f"/v1/pipelines/{pipeline['droneId']}/stream.mjpg"
+                    if self.settings.legacy_mjpeg_enabled
+                    else ""
+                ),
                 "processedPublisherPid": None,
+                "processedPublisherTransport": self.settings.processed_publish_transport,
+                "processedPublisherUrl": "",
+                "processedPublisherError": "",
+                "processedPublisherRestartCount": 0,
+                "processedPublisherFramesWritten": 0,
+                "processedPublisherDroppedFrames": 0,
+                "processedPublisherStable": False,
+                "processedPublisherUptimeSeconds": 0.0,
+                "legacyMjpegEnabled": self.settings.legacy_mjpeg_enabled,
                 "processedStreamRevision": 0,
                 "processedStreamStartedAt": "",
                 "currentEvent": None,
@@ -356,7 +402,19 @@ class PipelineManager:
             self._pipelines.pop(drone_id, None)
 
     def _cleanup_orphaned_publishers(self) -> None:
-        cleanup_orphaned_processed_publishers(set())
+        active_output_urls = {
+            output_url
+            for drone_id, pipeline in self._pipelines.items()
+            if pipeline.get("analyticsEnabled", True)
+            for output_url in [
+                self.settings.processed_publish_url(
+                    drone_id,
+                    str(pipeline.get("rtspUrl") or ""),
+                )
+            ]
+            if output_url
+        }
+        cleanup_orphaned_processed_publishers(active_output_urls)
 
     @staticmethod
     def _source_key(source: str) -> str:

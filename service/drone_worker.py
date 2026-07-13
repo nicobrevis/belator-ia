@@ -8,6 +8,7 @@ import signal
 import threading
 import time
 from pathlib import Path
+from queue import Empty
 import subprocess
 from time import perf_counter
 
@@ -17,10 +18,16 @@ import torch
 from ultralytics import YOLO
 
 from service.event_detector import EventDetector
+from service.latest_frame_queue import CapturedFrame, LatestFrameQueue
 from service.model_registry import ModelRegistry
 from service.nvr_store import NvrStore
 from service.recorder import EventRecorder
 from service.schemas import utc_now
+from service.processed_publisher import (
+    FfmpegFramePublisher,
+    PUBLISHER_PROCESS_MARKER,
+    sanitize_stream_url,
+)
 from service.second_stage_classifier import SecondStageClassifier, SecondStageSummary
 from service.settings import ServiceSettings
 
@@ -105,21 +112,20 @@ def _terminate_ffmpeg_process(pid: int) -> None:
         return
 
 
-def _terminate_matching_ffmpeg_processes(
-    match_value: str,
+def _terminate_marked_publisher_processes(
+    output_url: str,
     *,
-    required_tokens: tuple[str, ...] = (),
     exclude_pid: int | None = None,
 ) -> None:
-    if not match_value:
+    if not output_url:
         return
 
     for pid, command in _ffmpeg_processes():
         if exclude_pid and pid == exclude_pid:
             continue
-        if match_value not in command:
+        if output_url not in command:
             continue
-        if any(token not in command for token in required_tokens):
+        if PUBLISHER_PROCESS_MARKER not in command or "rawvideo" not in command:
             continue
         _terminate_ffmpeg_process(pid)
 
@@ -130,7 +136,7 @@ def cleanup_orphaned_processed_publishers(active_output_urls: set[str]) -> None:
             (
                 part
                 for part in command
-                if "/processed/" in part and part.startswith(("rtsp://", "rtmp://"))
+                if "/processed/" in part and part.startswith(("rtsp://", "rtsps://", "rtmp://", "rtmps://"))
             ),
             "",
         )
@@ -138,7 +144,11 @@ def cleanup_orphaned_processed_publishers(active_output_urls: set[str]) -> None:
         if not output_url or output_url in active_output_urls:
             continue
 
-        if "rawvideo" not in command or ("rtsp" not in command and "flv" not in command):
+        if (
+            PUBLISHER_PROCESS_MARKER not in command
+            or "rawvideo" not in command
+            or ("rtsp" not in command and "flv" not in command)
+        ):
             continue
 
         _terminate_ffmpeg_process(pid)
@@ -164,8 +174,6 @@ class _FfmpegY4mReader:
         self._last_frame_digest: bytes | None = None
         self._last_unique_frame_at = time.monotonic()
         self._startup_deadline = time.monotonic() + max(self._read_timeout_seconds * 3.0, 12.0)
-        _terminate_matching_ffmpeg_processes(source, required_tokens=("yuv4mpegpipe",))
-        _terminate_matching_ffmpeg_processes(source, required_tokens=("image2pipe",))
         self._command = [
             ffmpeg_path,
             "-hide_banner",
@@ -203,6 +211,7 @@ class _FfmpegY4mReader:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             bufsize=0,
+            start_new_session=True,
         )
 
     def isOpened(self) -> bool:  # noqa: N802
@@ -279,7 +288,9 @@ class _FfmpegY4mReader:
 
         self._width = width
         self._height = height
-        self._fps = fps
+        # Algunos streams RTSP exponen el timebase (por ejemplo 90000/1) en el
+        # campo F de Y4M. Eso no es FPS y no debe contaminar scheduling/health.
+        self._fps = fps if 0.1 <= fps <= 240.0 else 0.0
         self._frame_size = width * height * 3 // 2
         self._header_ready = True
         self._startup_deadline = 0.0
@@ -353,10 +364,16 @@ class _FfmpegY4mReader:
             return
         try:
             if process.poll() is None:
-                process.terminate()
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    process.terminate()
                 process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                process.kill()
             process.wait(timeout=3)
         finally:
             if process.stdout:
@@ -383,6 +400,13 @@ class DroneWorker:
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
+        self._processed_frame_sequence = 0
+        self._raw_frame_sequence = 0
+        self._processed_publisher: FfmpegFramePublisher | None = None
+        self._processed_publisher_signature: tuple[object, ...] | None = None
+        self._processed_publisher_next_retry_at = 0.0
+        self._processed_publisher_retry_delay = self.settings.processed_publish_retry_seconds
+        self._processed_publisher_start_count = 0
         self._model_id = ""
         self._model_name = ""
         self._latest_detections: dict[str, object] = self._empty_detections()
@@ -409,6 +433,14 @@ class DroneWorker:
             "frameHeight": None,
             "sourceFps": None,
             "processingFps": 0.0,
+            "framesCaptured": 0,
+            "framesDroppedBeforeInference": 0,
+            "captureQueueCapacity": 1,
+            "captureQueueDepth": 0,
+            "lastCapturedFrameAt": "",
+            "lastInferenceFrameAgeMs": None,
+            "avgInferenceFrameAgeMs": None,
+            "maxInferenceFrameAgeMs": None,
             "framesProcessed": 0,
             "detectionsTotal": 0,
             "avgInferenceMs": None,
@@ -423,8 +455,21 @@ class DroneWorker:
             "latestRawFrameAvailable": False,
             "latestRawFrameContentType": "image/jpeg",
             "processedStreamReady": False,
-            "processedStreamUrl": self.settings.processed_stream_url(str(pipeline.get("droneId") or "")),
+            "processedStreamUrl": (
+                f"/v1/pipelines/{str(pipeline.get('droneId') or '')}/stream.mjpg"
+                if self.settings.legacy_mjpeg_enabled
+                else ""
+            ),
             "processedPublisherPid": None,
+            "processedPublisherTransport": self.settings.processed_publish_transport,
+            "processedPublisherUrl": "",
+            "processedPublisherError": "",
+            "processedPublisherRestartCount": 0,
+            "processedPublisherFramesWritten": 0,
+            "processedPublisherDroppedFrames": 0,
+            "processedPublisherStable": False,
+            "processedPublisherUptimeSeconds": 0.0,
+            "legacyMjpegEnabled": self.settings.legacy_mjpeg_enabled,
             "processedStreamRevision": 0,
             "processedStreamStartedAt": "",
             "device": resolved_device,
@@ -487,9 +532,17 @@ class DroneWorker:
         with self._lock:
             return self._latest_processed_frame_jpeg
 
+    def latest_processed_frame_snapshot(self) -> tuple[int, bytes | None]:
+        with self._lock:
+            return self._processed_frame_sequence, self._latest_processed_frame_jpeg
+
     def latest_raw_frame(self) -> bytes | None:
         with self._lock:
             return self._latest_raw_frame_jpeg
+
+    def latest_raw_frame_snapshot(self) -> tuple[int, bytes | None]:
+        with self._lock:
+            return self._raw_frame_sequence, self._latest_raw_frame_jpeg
 
     def latest_detections(self) -> dict[str, object]:
         with self._lock:
@@ -592,38 +645,12 @@ class DroneWorker:
                 capture_pid=self._capture_pid(capture),
                 source_fps=source_fps,
             )
-            last_processed_at = 0.0
-
             try:
-                while not self._stop_event.is_set():
-                    ok, frame = capture.read()
-                    if not ok or frame is None:
-                        self._stop_processed_publisher()
-                        self._clear_preview()
-                        self._set_runtime(
-                            status="waiting_source",
-                            message="source frame read failed",
-                            sourceOpened=False,
-                            activeRtspConnections=0,
-                            singleIngestHealthy=True,
-                            lastSourceError="source frame read failed",
-                        )
-                        break
-
-                    now = time.monotonic()
-                    if last_processed_at and now - last_processed_at < min_frame_interval:
-                        continue
-                    last_processed_at = now
-
-                    pipeline = self._pipeline_snapshot()
-                    if not pipeline.get("analyticsEnabled", True):
-                        break
-                    min_frame_interval = 1.0 / max(
-                        0.5,
-                        float(pipeline.get("processingFps") or self.settings.processing_fps),
-                    )
-
-                    self._process_frame(frame, source_fps=source_fps, pipeline=pipeline)
+                self._run_capture_session(
+                    capture,
+                    source_fps=source_fps,
+                    initial_frame_interval=min_frame_interval,
+                )
             finally:
                 self._clear_active_capture(capture)
                 capture.release()
@@ -649,8 +676,147 @@ class DroneWorker:
                 if not pipeline.get("analyticsEnabled", True):
                     return
                 pipeline_fps = float(pipeline.get("processingFps") or self.settings.processing_fps)
-                self._process_frame(frame, source_fps=pipeline_fps, pipeline=pipeline)
+                captured_at = utc_now()
+                self._record_captured_frame(captured_at=captured_at, queue_depth=0, dropped=0)
+                self._process_frame(
+                    frame,
+                    source_fps=pipeline_fps,
+                    pipeline=pipeline,
+                    frame_age_ms=0.0,
+                    captured_at=captured_at,
+                )
                 time.sleep(1.0 / max(0.5, pipeline_fps))
+
+    def _run_capture_session(
+        self,
+        capture,
+        *,
+        source_fps: float,
+        initial_frame_interval: float,
+    ) -> None:
+        """Keep ingest current while inference consumes only the newest available frame."""
+
+        frame_queue: LatestFrameQueue[np.ndarray] = LatestFrameQueue()
+        session_stop = threading.Event()
+        capture_failed = threading.Event()
+
+        def capture_frames() -> None:
+            sequence = 0
+            while not self._stop_event.is_set() and not session_stop.is_set():
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    capture_failed.set()
+                    break
+
+                sequence += 1
+                captured_monotonic = time.monotonic()
+                captured_at = utc_now()
+                dropped = frame_queue.put_latest(
+                    CapturedFrame(
+                        sequence=sequence,
+                        value=frame,
+                        captured_monotonic=captured_monotonic,
+                        captured_at=captured_at,
+                    )
+                )
+                self._record_captured_frame(
+                    captured_at=captured_at,
+                    queue_depth=frame_queue.qsize(),
+                    dropped=dropped,
+                )
+
+        reader = threading.Thread(
+            target=capture_frames,
+            name=f"drone-capture-{self.pipeline_id}",
+            daemon=True,
+        )
+        reader.start()
+        next_inference_at = 0.0
+        frame_interval = initial_frame_interval
+        resolved_source_fps = max(0.0, float(source_fps or 0.0))
+
+        try:
+            while not self._stop_event.is_set():
+                now = time.monotonic()
+                if next_inference_at and now < next_inference_at:
+                    if capture_failed.is_set() and frame_queue.empty():
+                        break
+                    self._stop_event.wait(min(next_inference_at - now, 0.05))
+                    continue
+
+                try:
+                    captured = frame_queue.get(timeout=0.25)
+                except Empty:
+                    if capture_failed.is_set():
+                        break
+                    continue
+
+                captured, superseded = frame_queue.drain_to_latest(captured)
+                if superseded:
+                    self._record_dropped_before_inference(superseded)
+                if captured is None:
+                    continue
+
+                if resolved_source_fps <= 0.0:
+                    detected_source_fps = self._capture_fps(capture)
+                    if detected_source_fps > 0.0:
+                        resolved_source_fps = detected_source_fps
+                        self._set_runtime(sourceFps=round(resolved_source_fps, 2))
+
+                pipeline = self._pipeline_snapshot()
+                if not pipeline.get("analyticsEnabled", True):
+                    break
+                frame_interval = 1.0 / max(
+                    0.5,
+                    float(pipeline.get("processingFps") or self.settings.processing_fps),
+                )
+                inference_started_at = time.monotonic()
+                frame_age_ms = max(
+                    0.0,
+                    (inference_started_at - captured.captured_monotonic) * 1000.0,
+                )
+                self._set_runtime(captureQueueDepth=frame_queue.qsize())
+                self._process_frame(
+                    captured.value,
+                    source_fps=resolved_source_fps,
+                    pipeline=pipeline,
+                    frame_age_ms=frame_age_ms,
+                    captured_at=captured.captured_at,
+                )
+                next_inference_at = inference_started_at + frame_interval
+        finally:
+            session_stop.set()
+            capture.release()
+            reader.join(timeout=max(1.0, self.settings.rtsp_read_timeout_seconds + 0.5))
+            frame_queue.clear()
+            self._set_runtime(captureQueueDepth=0)
+
+        if capture_failed.is_set() and not self._stop_event.is_set():
+            self._stop_processed_publisher()
+            self._clear_preview()
+            self._set_runtime(
+                status="waiting_source",
+                message="source frame read failed",
+                sourceOpened=False,
+                activeRtspConnections=0,
+                singleIngestHealthy=True,
+                lastSourceError="source frame read failed",
+            )
+
+    def _record_captured_frame(self, *, captured_at: str, queue_depth: int, dropped: int) -> None:
+        with self._lock:
+            self._runtime["framesCaptured"] = int(self._runtime.get("framesCaptured") or 0) + 1
+            self._runtime["framesDroppedBeforeInference"] = (
+                int(self._runtime.get("framesDroppedBeforeInference") or 0) + int(dropped)
+            )
+            self._runtime["captureQueueDepth"] = min(max(int(queue_depth), 0), 1)
+            self._runtime["lastCapturedFrameAt"] = captured_at
+
+    def _record_dropped_before_inference(self, dropped: int) -> None:
+        with self._lock:
+            self._runtime["framesDroppedBeforeInference"] = (
+                int(self._runtime.get("framesDroppedBeforeInference") or 0) + int(dropped)
+            )
 
     def _resolve_image_paths(self, source_path: Path) -> list[Path]:
         if source_path.is_dir():
@@ -718,10 +884,18 @@ class DroneWorker:
         except Exception:
             return 0.0
 
-    def _process_frame(self, frame, *, source_fps: float, pipeline: dict[str, object]) -> None:
+    def _process_frame(
+        self,
+        frame,
+        *,
+        source_fps: float,
+        pipeline: dict[str, object],
+        frame_age_ms: float,
+        captured_at: str,
+    ) -> None:
         frame = self._prepare_frame(frame)
         self._update_raw_preview(frame)
-        frame_at = utc_now()
+        frame_at = captured_at or utc_now()
 
         model_info = self._ensure_model(pipeline)
         if not model_info:
@@ -857,6 +1031,11 @@ class DroneWorker:
 
         self._update_detections(structured_detections)
         self._update_preview(annotated)
+        self._publish_processed_frame(
+            annotated,
+            fps=effective_fps,
+            source_url=str(pipeline.get("rtspUrl") or ""),
+        )
         self._update_runtime_after_frame(
             frame_at=frame_at,
             frame_width=frame_width,
@@ -867,6 +1046,7 @@ class DroneWorker:
             max_confidence=max_confidence,
             event=event,
             second_stage_summary=second_stage_summary,
+            frame_age_ms=frame_age_ms,
         )
 
     def _empty_detections(self) -> dict[str, object]:
@@ -1510,42 +1690,232 @@ class DroneWorker:
         return encoded.tobytes() if success else None
 
     def _update_raw_preview(self, frame) -> None:
+        if not self.settings.legacy_mjpeg_enabled:
+            with self._lock:
+                if self._latest_raw_frame_jpeg is not None:
+                    self._latest_raw_frame_jpeg = None
+                    self._raw_frame_sequence += 1
+                self._runtime["latestRawFrameAvailable"] = False
+            return
         encoded = self._encode_preview(frame)
         with self._lock:
             self._latest_raw_frame_jpeg = encoded
+            self._raw_frame_sequence += 1
             self._runtime["latestRawFrameAvailable"] = encoded is not None
             self._runtime["latestRawFrameContentType"] = "image/jpeg"
 
     def _update_preview(self, frame) -> None:
+        if not self.settings.legacy_mjpeg_enabled:
+            with self._lock:
+                if self._latest_processed_frame_jpeg is not None:
+                    self._latest_processed_frame_jpeg = None
+                    self._processed_frame_sequence += 1
+                self._runtime["latestFrameAvailable"] = False
+                self._runtime["latestProcessedFrameAvailable"] = False
+            return
         encoded = self._encode_preview(frame)
         with self._lock:
             self._latest_processed_frame_jpeg = encoded
+            self._processed_frame_sequence += 1
             processed_available = encoded is not None
-            was_ready = bool(self._runtime.get("processedStreamReady"))
             self._runtime["latestFrameAvailable"] = processed_available
             self._runtime["latestFrameContentType"] = "image/jpeg"
             self._runtime["latestProcessedFrameAvailable"] = processed_available
             self._runtime["latestProcessedFrameContentType"] = "image/jpeg"
-            self._runtime["processedStreamReady"] = processed_available
-            self._runtime["processedStreamUrl"] = f"/v1/pipelines/{self.pipeline_id}/stream.mjpg"
-            self._runtime["processedPublisherPid"] = None
-            if processed_available and not was_ready:
+
+    def _publish_processed_frame(self, frame, *, fps: float, source_url: str) -> None:
+        fallback_url = self._legacy_mjpeg_fallback_url()
+        fallback_status = (
+            "legacy MJPEG fallback active"
+            if fallback_url
+            else "legacy MJPEG is disabled"
+        )
+        if not self.settings.processed_rtsp_enabled:
+            self._stop_processed_publisher()
+            self._set_runtime(
+                processedPublisherError=f"publisher disabled by configuration; {fallback_status}"
+            )
+            return
+
+        output_url = self.settings.processed_publish_url(self.pipeline_id, source_url)
+        safe_output_url = sanitize_stream_url(output_url)
+        if not output_url:
+            self._stop_processed_publisher()
+            self._set_runtime(
+                processedPublisherUrl="",
+                processedPublisherError=(
+                    "publisher URL is not configured; set PYRONE_PROCESSED_RTMP_URL_TEMPLATE; "
+                    f"{fallback_status}"
+                ),
+            )
+            return
+
+        height, width = frame.shape[:2]
+        publish_fps = min(
+            max(float(fps or 1.0), 1.0),
+            self.settings.processed_publish_max_fps,
+        )
+        signature = (
+            self.settings.processed_publish_transport,
+            output_url,
+            int(width),
+            int(height),
+            round(publish_fps, 3),
+        )
+        now = time.monotonic()
+        publisher = self._processed_publisher
+
+        if publisher and self._processed_publisher_signature != signature:
+            self._stop_processed_publisher(reset_retry=True)
+            publisher = None
+
+        if publisher and not publisher.is_running():
+            error = publisher.last_error or "processed publisher stopped"
+            self._stop_processed_publisher(reset_retry=False)
+            self._schedule_publisher_retry(now)
+            self._set_runtime(processedPublisherError=error)
+            publisher = None
+
+        if publisher is None:
+            if now < self._processed_publisher_next_retry_at:
+                self._set_runtime(
+                    processedStreamReady=False,
+                    processedStreamUrl=fallback_url,
+                    processedPublisherUrl=safe_output_url,
+                )
+                return
+
+            try:
+                _terminate_marked_publisher_processes(output_url)
+                publisher = FfmpegFramePublisher(
+                    ffmpeg_path=self.settings.ffmpeg_path,
+                    output_url=output_url,
+                    transport=self.settings.processed_publish_transport,
+                    width=width,
+                    height=height,
+                    fps=publish_fps,
+                    bitrate=self.settings.processed_rtsp_bitrate,
+                    bufsize=self.settings.processed_rtsp_bufsize,
+                    preset=self.settings.processed_rtsp_preset,
+                    write_timeout_seconds=self.settings.processed_rtsp_write_timeout_seconds,
+                    startup_timeout_seconds=(
+                        self.settings.processed_publish_startup_timeout_seconds
+                    ),
+                    ready_after_seconds=self.settings.processed_publish_ready_after_seconds,
+                    ready_freshness_seconds=(
+                        self.settings.processed_publish_ready_freshness_seconds
+                    ),
+                    stable_reset_seconds=(
+                        self.settings.processed_publish_stable_reset_seconds
+                    ),
+                    stale_frame_seconds=self.settings.processed_publish_stale_seconds,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self._schedule_publisher_retry(now)
+                self._set_runtime(
+                    processedStreamReady=False,
+                    processedStreamUrl=fallback_url,
+                    processedPublisherPid=None,
+                    processedPublisherUrl=safe_output_url,
+                    processedPublisherError=str(error),
+                )
+                return
+
+            self._processed_publisher = publisher
+            self._processed_publisher_signature = signature
+            self._processed_publisher_start_count += 1
+            self._processed_publisher_next_retry_at = 0.0
+
+        payload = np.ascontiguousarray(frame, dtype=np.uint8).tobytes()
+        accepted = publisher.write(payload)
+        if not accepted:
+            error = publisher.last_error or "processed publisher rejected a frame"
+            self._stop_processed_publisher(reset_retry=False)
+            self._schedule_publisher_retry(now)
+            self._set_runtime(processedPublisherError=error)
+            return
+
+        if not publisher.is_running():
+            error = publisher.last_error or "processed publisher stopped during startup"
+            self._stop_processed_publisher(reset_retry=False)
+            self._schedule_publisher_retry(now)
+            self._set_runtime(processedPublisherError=error)
+            return
+
+        ready = publisher.ready
+        stable = publisher.stable
+
+        self._reset_publisher_backoff_if_stable(stable)
+
+        with self._lock:
+            was_ready = bool(self._runtime.get("processedStreamReady"))
+            self._runtime.update(
+                {
+                    "processedStreamReady": ready,
+                    "processedStreamUrl": safe_output_url if ready else fallback_url,
+                    "processedPublisherPid": publisher.pid,
+                    "processedPublisherTransport": self.settings.processed_publish_transport,
+                    "processedPublisherUrl": safe_output_url,
+                    "processedPublisherError": publisher.last_error,
+                    "processedPublisherRestartCount": max(
+                        0,
+                        self._processed_publisher_start_count - 1,
+                    ),
+                    "processedPublisherFramesWritten": publisher.frames_written,
+                    "processedPublisherDroppedFrames": publisher.frames_dropped,
+                    "processedPublisherStable": stable,
+                    "processedPublisherUptimeSeconds": round(
+                        publisher.uptime_seconds,
+                        2,
+                    ),
+                }
+            )
+            if ready and not was_ready:
                 self._runtime["processedStreamRevision"] = (
                     int(self._runtime.get("processedStreamRevision") or 0) + 1
                 )
                 self._runtime["processedStreamStartedAt"] = utc_now()
 
-    def _stop_processed_publisher(self) -> None:
+    def _schedule_publisher_retry(self, now: float) -> None:
+        self._processed_publisher_next_retry_at = now + self._processed_publisher_retry_delay
+        self._processed_publisher_retry_delay = min(
+            self._processed_publisher_retry_delay * 2.0,
+            self.settings.processed_publish_retry_max_seconds,
+        )
+
+    def _reset_publisher_backoff_if_stable(self, stable: bool) -> None:
+        if not stable:
+            return
+        self._processed_publisher_retry_delay = self.settings.processed_publish_retry_seconds
+        self._processed_publisher_next_retry_at = 0.0
+
+    def _stop_processed_publisher(self, *, reset_retry: bool = True) -> None:
+        publisher = self._processed_publisher
+        self._processed_publisher = None
+        self._processed_publisher_signature = None
+        if publisher:
+            publisher.release()
+        if reset_retry:
+            self._processed_publisher_next_retry_at = 0.0
+            self._processed_publisher_retry_delay = self.settings.processed_publish_retry_seconds
         self._set_runtime(
             processedStreamReady=False,
             processedPublisherPid=None,
-            processedStreamUrl=f"/v1/pipelines/{self.pipeline_id}/stream.mjpg",
+            processedPublisherStable=False,
+            processedStreamUrl=self._legacy_mjpeg_fallback_url(),
         )
+
+    def _legacy_mjpeg_fallback_url(self) -> str:
+        if not self.settings.legacy_mjpeg_enabled:
+            return ""
+        return f"/v1/pipelines/{self.pipeline_id}/stream.mjpg"
 
     def _clear_processed_preview(self) -> None:
         self._stop_processed_publisher()
         with self._lock:
-            self._latest_processed_frame_jpeg = None
+            if self._latest_processed_frame_jpeg is not None:
+                self._latest_processed_frame_jpeg = None
+                self._processed_frame_sequence += 1
             self._runtime["latestFrameAvailable"] = False
             self._runtime["latestProcessedFrameAvailable"] = False
             self._latest_detections = self._empty_detections()
@@ -1553,8 +1923,12 @@ class DroneWorker:
     def _clear_preview(self) -> None:
         self._stop_processed_publisher()
         with self._lock:
-            self._latest_processed_frame_jpeg = None
-            self._latest_raw_frame_jpeg = None
+            if self._latest_processed_frame_jpeg is not None:
+                self._latest_processed_frame_jpeg = None
+                self._processed_frame_sequence += 1
+            if self._latest_raw_frame_jpeg is not None:
+                self._latest_raw_frame_jpeg = None
+                self._raw_frame_sequence += 1
             self._runtime["latestFrameAvailable"] = False
             self._runtime["latestProcessedFrameAvailable"] = False
             self._runtime["latestRawFrameAvailable"] = False
@@ -1572,6 +1946,7 @@ class DroneWorker:
         max_confidence: float,
         event: EventUpdate,
         second_stage_summary: SecondStageSummary,
+        frame_age_ms: float,
     ) -> None:
         self._fps_window.append(time.monotonic())
         processing_fps = 0.0
@@ -1588,6 +1963,19 @@ class DroneWorker:
                 inference_ms
                 if previous_avg is None
                 else ((float(previous_avg) * (frames_processed - 1)) + inference_ms) / frames_processed
+            )
+            previous_age_avg = self._runtime.get("avgInferenceFrameAgeMs")
+            avg_frame_age_ms = (
+                frame_age_ms
+                if previous_age_avg is None
+                else (
+                    (float(previous_age_avg) * (frames_processed - 1)) + frame_age_ms
+                )
+                / frames_processed
+            )
+            max_frame_age_ms = max(
+                float(self._runtime.get("maxInferenceFrameAgeMs") or 0.0),
+                frame_age_ms,
             )
             self._runtime.update(
                 {
@@ -1606,6 +1994,9 @@ class DroneWorker:
                     "framesProcessed": frames_processed,
                     "detectionsTotal": detections_total,
                     "avgInferenceMs": round(avg_inference_ms, 2),
+                    "lastInferenceFrameAgeMs": round(frame_age_ms, 2),
+                    "avgInferenceFrameAgeMs": round(avg_frame_age_ms, 2),
+                    "maxInferenceFrameAgeMs": round(max_frame_age_ms, 2),
                     "lastFrameAt": frame_at,
                     "currentEvent": event.active_event,
                     "secondStageEnabled": second_stage_summary.enabled,

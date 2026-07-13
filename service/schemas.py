@@ -10,7 +10,7 @@ PIPELINE_AUTO_MODEL_KEYS = ("unknown", "wide", "thermal", "zoom", "visual")
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def normalize_drone_id(value: object, fallback: str = "drone") -> str:
@@ -145,6 +145,10 @@ def normalize_pipeline_payload(
         "processingFps": normalize_processing_fps(
             source.get("processingFps"),
             normalize_processing_fps(previous.get("processingFps"), 20.0),
+        ),
+        "secondStageEnabled": coerce_bool(
+            source.get("secondStageEnabled"),
+            bool(previous.get("secondStageEnabled", True)),
         ),
         "recordOnEvent": coerce_bool(source.get("recordOnEvent"), bool(previous.get("recordOnEvent", True))),
         "recordingSegmentMode": normalize_recording_segment_mode(
