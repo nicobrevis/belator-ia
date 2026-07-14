@@ -155,39 +155,59 @@ class DroneWorkerProcess:
         self.log_path = self.worker_dir / "worker.log"
         self._process: subprocess.Popen[bytes] | None = None
         self._started_at = ""
+        self._started_monotonic = 0.0
+        self._restart_retry_delay = self.settings.reconnect_delay_seconds
+        self._restart_next_at = 0.0
+        self._restart_count = 0
+        self._last_restart_error = ""
 
-    def start(self) -> None:
+    def start(self) -> bool:
         running_pid = self.pid if self.is_running() else None
         if running_pid:
             self._stop_duplicate_processes(keep_pid=running_pid)
-            return
+            return True
 
         self.worker_dir.mkdir(parents=True, exist_ok=True)
         self._stop_duplicate_processes()
         self._write_pipeline()
         self._clear_transient_files()
 
-        log_stream = self.log_path.open("ab", buffering=0)
         try:
-            self._process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "service.worker_main",
-                    "--drone-id",
-                    self.drone_id,
-                    "--worker-dir",
-                    str(self.worker_dir),
-                ],
-                cwd=str(self.settings.repo_dir),
-                stdin=subprocess.DEVNULL,
-                stdout=log_stream,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
+            log_stream = self.log_path.open("ab", buffering=0)
+            try:
+                self._process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-m",
+                        "service.worker_main",
+                        "--drone-id",
+                        self.drone_id,
+                        "--worker-dir",
+                        str(self.worker_dir),
+                    ],
+                    cwd=str(self.settings.repo_dir),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_stream,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            finally:
+                log_stream.close()
+        except (OSError, subprocess.SubprocessError) as error:
+            self._process = None
+            self._last_restart_error = str(error)
+            self._write_runtime_overlay(
+                {
+                    "status": "crashed",
+                    "message": f"could not start dedicated worker: {error}",
+                    "sourceOpened": False,
+                    "workerProcessPid": None,
+                    "workerProcessRunning": False,
+                }
             )
-        finally:
-            log_stream.close()
+            return False
         self._started_at = utc_now()
+        self._started_monotonic = time.monotonic()
         self.pid_path.write_text(f"{self._process.pid}\n", encoding="utf-8")
         self._write_runtime_overlay(
             {
@@ -200,6 +220,7 @@ class DroneWorkerProcess:
                 "workerProcessLogPath": str(self.log_path),
             }
         )
+        return True
 
     def stop(self, timeout: float = 5.0) -> None:
         pid = self.pid
@@ -216,6 +237,7 @@ class DroneWorkerProcess:
             _terminate_process(pid, timeout=timeout)
 
         self._process = None
+        self._restart_next_at = 0.0
         self._write_runtime_overlay(
             {
                 "status": "stopped",
@@ -234,7 +256,65 @@ class DroneWorkerProcess:
         if running_pid:
             self._stop_duplicate_processes(keep_pid=running_pid)
         else:
-            self.start()
+            self.ensure_running()
+
+    def ensure_running(self, *, now: float | None = None) -> bool:
+        """Supervise and respawn a crashed child without creating a tight loop."""
+
+        checked_at = time.monotonic() if now is None else float(now)
+        if self.is_running():
+            if (
+                self._started_monotonic
+                and checked_at - self._started_monotonic
+                >= float(getattr(self.settings, "source_stable_reset_seconds", 10.0))
+            ):
+                self._restart_retry_delay = self.settings.reconnect_delay_seconds
+                self._restart_next_at = 0.0
+                self._last_restart_error = ""
+            return True
+
+        if checked_at < self._restart_next_at:
+            retry_in = max(0.0, self._restart_next_at - checked_at)
+            self._write_runtime_overlay(
+                {
+                    "status": "crashed",
+                    "message": f"dedicated worker crashed; retrying in {retry_in:.1f}s",
+                    "sourceOpened": False,
+                    "workerProcessPid": None,
+                    "workerProcessRunning": False,
+                }
+            )
+            return False
+
+        retry_max = max(
+            self.settings.reconnect_delay_seconds,
+            float(getattr(self.settings, "reconnect_delay_max_seconds", 30.0)),
+        )
+        delay = min(
+            max(self._restart_retry_delay, self.settings.reconnect_delay_seconds),
+            retry_max,
+        )
+        self._restart_count += 1
+        self._restart_next_at = checked_at + delay
+        self._restart_retry_delay = min(
+            delay * 2.0,
+            retry_max,
+        )
+        started = self.start()
+        if not started:
+            self._write_runtime_overlay(
+                {
+                    "status": "crashed",
+                    "message": (
+                        f"worker restart failed; retrying in {delay:.1f}s"
+                        + (f": {self._last_restart_error}" if self._last_restart_error else "")
+                    ),
+                    "sourceOpened": False,
+                    "workerProcessPid": None,
+                    "workerProcessRunning": False,
+                }
+            )
+        return started
 
     def runtime_snapshot(self) -> dict[str, object]:
         runtime = self._runtime_with_defaults()
@@ -248,6 +328,13 @@ class DroneWorkerProcess:
                 "workerProcessMode": "process",
                 "workerProcessStartedAt": runtime.get("workerProcessStartedAt") or self._started_at,
                 "workerProcessLogPath": str(self.log_path),
+                "workerProcessRestartCount": self._restart_count,
+                "workerProcessRetryDelaySeconds": (
+                    round(max(0.0, self._restart_next_at - time.monotonic()), 2)
+                    if not running
+                    else 0.0
+                ),
+                "workerProcessLastRestartError": self._last_restart_error,
             }
         )
 
@@ -415,6 +502,10 @@ class DroneWorkerProcess:
             "sourceSessionId": "",
             "sourceOpenCount": 0,
             "sourceReconnectCount": 0,
+            "sourceRetryCount": 0,
+            "sourceRetryDelaySeconds": 0.0,
+            "sourceStable": False,
+            "sourceStallCount": 0,
             "lastSourceOpenAt": "",
             "lastSourceCloseAt": "",
             "lastSourceError": "",
@@ -475,6 +566,13 @@ class DroneWorkerProcess:
             "processedStreamStartedAt": "",
             "modelId": str(self._pipeline.get("currentModelId") or ""),
             "modelName": "",
+            "modelRetryCount": 0,
+            "modelRetryDelaySeconds": 0.0,
+            "modelRegistryRevision": 0,
+            "modelCatalogError": "",
+            "workerProcessRestartCount": self._restart_count,
+            "workerProcessRetryDelaySeconds": 0.0,
+            "workerProcessLastRestartError": self._last_restart_error,
         }
         return {**defaults, **runtime}
 

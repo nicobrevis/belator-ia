@@ -8,6 +8,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 from service.latest_frame_queue import CapturedFrame, LatestFrameQueue
+from service.runtime_log import safe_console_log
 
 
 PUBLISHER_PROCESS_MARKER = "comment=pyrone-processed-publisher"
@@ -494,9 +495,8 @@ class FfmpegFramePublisher:
                 return
             self._failed = True
             self._last_error = detail
-        print(
-            f"[processed-publisher] output={self.safe_output_url} failed: {detail}",
-            flush=True,
+        safe_console_log(
+            f"[processed-publisher] output={self.safe_output_url} failed: {detail}"
         )
 
     def release(self) -> None:

@@ -84,6 +84,11 @@ class ServiceSettings:
     processing_fps: float
     rtsp_read_timeout_seconds: float
     reconnect_delay_seconds: float
+    reconnect_delay_max_seconds: float
+    source_stable_reset_seconds: float
+    capture_stall_timeout_seconds: float
+    model_retry_seconds: float
+    model_retry_max_seconds: float
     pre_event_seconds: float
     post_event_seconds: float
     event_cooldown_seconds: float
@@ -191,6 +196,32 @@ def load_settings() -> ServiceSettings:
             publish_retry_seconds,
         ),
         300.0,
+    )
+    reconnect_delay_seconds = min(
+        max(_read_float("PYRONE_RECONNECT_DELAY_SECONDS", 2.0), 0.5),
+        60.0,
+    )
+    reconnect_delay_max_seconds = min(
+        max(
+            _read_float("PYRONE_RECONNECT_DELAY_MAX_SECONDS", 30.0),
+            reconnect_delay_seconds,
+        ),
+        300.0,
+    )
+    model_retry_seconds = min(
+        max(_read_float("PYRONE_MODEL_RETRY_SECONDS", 2.0), 0.5),
+        60.0,
+    )
+    model_retry_max_seconds = min(
+        max(
+            _read_float("PYRONE_MODEL_RETRY_MAX_SECONDS", 30.0),
+            model_retry_seconds,
+        ),
+        300.0,
+    )
+    rtsp_read_timeout_seconds = max(
+        0.5,
+        _read_float("PYRONE_RTSP_READ_TIMEOUT_SECONDS", 5.0),
     )
 
     settings = ServiceSettings(
@@ -308,8 +339,22 @@ def load_settings() -> ServiceSettings:
             1024,
         ),
         processing_fps=max(0.5, _read_float("PYRONE_PROCESSING_FPS", 20.0)),
-        rtsp_read_timeout_seconds=max(0.5, _read_float("PYRONE_RTSP_READ_TIMEOUT_SECONDS", 5.0)),
-        reconnect_delay_seconds=max(0.5, _read_float("PYRONE_RECONNECT_DELAY_SECONDS", 2.0)),
+        rtsp_read_timeout_seconds=rtsp_read_timeout_seconds,
+        reconnect_delay_seconds=reconnect_delay_seconds,
+        reconnect_delay_max_seconds=reconnect_delay_max_seconds,
+        source_stable_reset_seconds=max(
+            1.0,
+            _read_float("PYRONE_SOURCE_STABLE_RESET_SECONDS", 10.0),
+        ),
+        capture_stall_timeout_seconds=max(
+            rtsp_read_timeout_seconds,
+            _read_float(
+                "PYRONE_CAPTURE_STALL_TIMEOUT_SECONDS",
+                max(rtsp_read_timeout_seconds * 2.0, 10.0),
+            ),
+        ),
+        model_retry_seconds=model_retry_seconds,
+        model_retry_max_seconds=model_retry_max_seconds,
         pre_event_seconds=max(0.0, _read_float("PYRONE_PRE_EVENT_SECONDS", 10.0)),
         post_event_seconds=max(1.0, _read_float("PYRONE_POST_EVENT_SECONDS", 15.0)),
         event_cooldown_seconds=max(0.0, _read_float("PYRONE_EVENT_COOLDOWN_SECONDS", 20.0)),

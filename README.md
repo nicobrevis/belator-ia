@@ -74,6 +74,35 @@ en vez de acumular retraso. El runtime expone `framesCaptured`,
 `framesDroppedBeforeInference`, `lastInferenceFrameAgeMs` y
 `avgInferenceFrameAgeMs` para observar ese comportamiento.
 
+### Recuperacion automatica
+
+La entrada RTSP, la carga de modelos y los procesos dedicados se supervisan de
+forma continua. Una perdida de cuadros, una fuente que queda estancada, un
+modelo temporalmente ausente o un worker que termina ya no dejan el pipeline en
+un estado terminal: se reintenta indefinidamente con backoff exponencial
+acotado. El backoff vuelve al valor inicial despues de estabilidad sostenida.
+El catalogo se recarga al cambiar en disco y conserva la ultima version valida
+si una lectura o un JSON incompleto falla durante una actualizacion.
+
+Los umbrales se pueden ajustar en `/etc/pyrone/analytics.env`:
+
+```bash
+PYRONE_RTSP_READ_TIMEOUT_SECONDS=5
+PYRONE_CAPTURE_STALL_TIMEOUT_SECONDS=10
+PYRONE_RECONNECT_DELAY_SECONDS=2
+PYRONE_RECONNECT_DELAY_MAX_SECONDS=30
+PYRONE_SOURCE_STABLE_RESET_SECONDS=10
+PYRONE_MODEL_RETRY_SECONDS=2
+PYRONE_MODEL_RETRY_MAX_SECONDS=30
+```
+
+El runtime publica `sourceRetryCount`, `sourceRetryDelaySeconds`,
+`sourceStallCount`, `modelRetryCount`, `modelCatalogError` y
+`workerProcessRestartCount` para que el sitio pueda mostrar el estado real de
+recuperacion. El identificador historico `pyronear-yolov8s-wide` se resuelve al
+modelo canonico `pyrone-yolov8s-wide`; futuras migraciones pueden declarar
+`aliases` en la entrada correspondiente de `catalog.json`.
+
 ### Segunda etapa de clasificacion
 
 El servicio puede usar un clasificador YOLOv8s adicional para validar detecciones

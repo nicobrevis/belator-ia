@@ -1,0 +1,38 @@
+{
+  "models": [
+    {
+      "id": "smoke-wide-v1",
+      "name": "Smoke Wide v1",
+      "description": "Wide-angle smoke segmentation baseline for daylight RGB footage.",
+      "sensorTypes": ["wide", "visual", "zoom", "unknown"],
+      "defaultFor": ["wide", "visual", "unknown"],
+      "weightsPath": "smoke_dataset/runs/pyrone_172_v1_yolo11n_seg_e80_i960_b2/weights/best.pt",
+      "imageSize": 960,
+      "enabled": true
+    },
+    {
+      "id": "pyrone-yolov8s-wide",
+      "name": "Pyrone YOLOv8s Wide",
+      "description": "Visible-spectrum YOLOv8s wildfire smoke/fire detector from Pyrone.",
+      "sensorTypes": ["wide", "visual", "zoom", "unknown"],
+      "defaultFor": [],
+      "weightsPath": "service/models/pyrone-yolov8s.pt",
+      "imageSize": 640,
+      "iouThreshold": 0.1,
+      "preprocessor": "skyline_composite",
+      "compositeIntermediateWidth": 1280,
+      "compositeNmsIou": 0.5,
+      "enabled": true
+    },
+    {
+      "id": "smoke-thermal-v1",
+      "name": "Smoke Thermal v1",
+      "description": "Thermal smoke segmentation baseline for H30T IR video.",
+      "sensorTypes": ["thermal"],
+      "defaultFor": ["thermal"],
+      "weightsPath": "smoke_dataset/runs/thermal_v1_yolo11n_seg_e100_i1024_b2/weights/best.pt",
+      "imageSize": 1024,
+      "enabled": true
+    }
+  ]
+}

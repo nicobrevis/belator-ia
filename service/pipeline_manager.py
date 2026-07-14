@@ -264,6 +264,9 @@ class PipelineManager:
     def _copy_pipeline(self, pipeline: dict[str, object] | None) -> dict[str, object]:
         if not pipeline:
             return {}
+        model_registry = getattr(self, "model_registry", None)
+        model_registry_revision = int(getattr(model_registry, "revision", 0) or 0)
+        model_catalog_error = str(getattr(model_registry, "last_reload_error", "") or "")
         public = {
             **pipeline,
             "autoModelMap": dict(pipeline.get("autoModelMap", {})),
@@ -292,6 +295,7 @@ class PipelineManager:
         }
         worker = self._workers.get(str(pipeline["droneId"]))
         if worker:
+            worker.ensure_running()
             runtime = worker.runtime_snapshot()
             public["runtime"] = runtime
             public["processedStreamReady"] = bool(runtime.get("processedStreamReady"))
@@ -311,6 +315,10 @@ class PipelineManager:
                 "sourceSessionId": "",
                 "sourceOpenCount": 0,
                 "sourceReconnectCount": 0,
+                "sourceRetryCount": 0,
+                "sourceRetryDelaySeconds": 0.0,
+                "sourceStable": False,
+                "sourceStallCount": 0,
                 "lastSourceOpenAt": "",
                 "lastSourceCloseAt": "",
                 "lastSourceError": "",
@@ -348,6 +356,13 @@ class PipelineManager:
                 "processedStreamStartedAt": "",
                 "currentEvent": None,
                 "lastRecording": None,
+                "modelRetryCount": 0,
+                "modelRetryDelaySeconds": 0.0,
+                "modelRegistryRevision": model_registry_revision,
+                "modelCatalogError": model_catalog_error,
+                "workerProcessRestartCount": 0,
+                "workerProcessRetryDelaySeconds": 0.0,
+                "workerProcessLastRestartError": "",
             }
         return public
 

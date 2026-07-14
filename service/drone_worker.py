@@ -30,6 +30,7 @@ from service.processed_publisher import (
 )
 from service.second_stage_classifier import SecondStageClassifier, SecondStageSummary
 from service.settings import ServiceSettings
+from service.runtime_log import safe_console_log
 
 
 _PYRONE_WATERMARK_IMAGE: np.ndarray | None = None
@@ -397,6 +398,7 @@ class DroneWorker:
         self._lock = threading.Lock()
         self._pipeline = dict(pipeline)
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._latest_processed_frame_jpeg: bytes | None = None
         self._latest_raw_frame_jpeg: bytes | None = None
@@ -407,6 +409,13 @@ class DroneWorker:
         self._processed_publisher_next_retry_at = 0.0
         self._processed_publisher_retry_delay = self.settings.processed_publish_retry_seconds
         self._processed_publisher_start_count = 0
+        self._source_retry_delay = self.settings.reconnect_delay_seconds
+        self._source_retry_count = 0
+        self._model_retry_delay = self.settings.model_retry_seconds
+        self._model_retry_next_at = 0.0
+        self._model_retry_count = 0
+        self._model_registry_revision = 0
+        self._model_loaded_signature: tuple[object, ...] | None = None
         self._model_id = ""
         self._model_name = ""
         self._latest_detections: dict[str, object] = self._empty_detections()
@@ -426,6 +435,10 @@ class DroneWorker:
             "sourceSessionId": "",
             "sourceOpenCount": 0,
             "sourceReconnectCount": 0,
+            "sourceRetryCount": 0,
+            "sourceRetryDelaySeconds": 0.0,
+            "sourceStable": False,
+            "sourceStallCount": 0,
             "lastSourceOpenAt": "",
             "lastSourceCloseAt": "",
             "lastSourceError": "",
@@ -476,6 +489,10 @@ class DroneWorker:
             "processedStreamRevision": 0,
             "processedStreamStartedAt": "",
             "device": resolved_device,
+            "modelRetryCount": 0,
+            "modelRetryDelaySeconds": 0.0,
+            "modelRegistryRevision": self.model_registry.revision,
+            "modelCatalogError": self.model_registry.last_reload_error,
             "secondStageEnabled": self.settings.second_stage_enabled and bool(pipeline.get("secondStageEnabled", True)),
             "secondStageApplied": False,
             "secondStageAvailable": self.settings.second_stage_model_path.exists(),
@@ -514,6 +531,7 @@ class DroneWorker:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         self._release_active_capture()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=timeout)
@@ -527,6 +545,7 @@ class DroneWorker:
     def update_pipeline(self, pipeline: dict[str, object]) -> None:
         with self._lock:
             self._pipeline = dict(pipeline)
+        self._wake_event.set()
 
     def latest_frame(self) -> bytes | None:
         return self.latest_processed_frame()
@@ -574,6 +593,29 @@ class DroneWorker:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
+            try:
+                self._run_forever()
+            except Exception as error:
+                pipeline = self._pipeline_snapshot()
+                source = str(pipeline.get("rtspUrl") or "")
+                detail = str(error)
+                if source:
+                    detail = detail.replace(source, self._sanitize_source_url(source))
+                reason = f"unexpected worker error: {detail}"
+                self._release_active_capture()
+                self._clear_preview()
+                self._set_runtime(
+                    status="waiting_source",
+                    message=reason,
+                    sourceOpened=False,
+                    activeRtspConnections=0,
+                    singleIngestHealthy=True,
+                    lastSourceError=reason,
+                )
+                self._wait_for_source_retry(reason)
+
+    def _run_forever(self) -> None:
+        while not self._stop_event.is_set():
             pipeline = self._pipeline_snapshot()
             min_frame_interval = 1.0 / max(
                 0.5,
@@ -589,7 +631,7 @@ class DroneWorker:
                     activeRtspConnections=0,
                     singleIngestHealthy=True,
                 )
-                time.sleep(0.5)
+                self._wait_interruptibly(0.5)
                 continue
 
             source = str(pipeline.get("rtspUrl") or "").strip()
@@ -603,7 +645,7 @@ class DroneWorker:
                     activeRtspConnections=0,
                     singleIngestHealthy=True,
                 )
-                time.sleep(self.settings.reconnect_delay_seconds)
+                self._wait_for_source_retry("missing source URL")
                 continue
 
             source_path = Path(source)
@@ -620,10 +662,25 @@ class DroneWorker:
                 self._process_image_source(source_path)
                 self._mark_source_closed(last_error="")
                 if not self._stop_event.is_set():
-                    time.sleep(self.settings.reconnect_delay_seconds)
+                    self._wait_for_source_retry("image source ended")
                 continue
 
-            capture = self._open_capture(source)
+            try:
+                capture = self._open_capture(source)
+            except Exception as error:
+                safe_error = f"could not create source capture: {error}"
+                self._stop_processed_publisher()
+                self._clear_preview()
+                self._set_runtime(
+                    status="waiting_source",
+                    message=safe_error,
+                    sourceOpened=False,
+                    activeRtspConnections=0,
+                    singleIngestHealthy=True,
+                    lastSourceError=safe_error,
+                )
+                self._wait_for_source_retry(safe_error)
+                continue
             if not capture.isOpened():
                 self._stop_processed_publisher()
                 self._clear_preview()
@@ -636,7 +693,9 @@ class DroneWorker:
                     lastSourceError=f"could not open source {self._sanitize_source_url(source)}",
                 )
                 capture.release()
-                time.sleep(self.settings.reconnect_delay_seconds)
+                self._wait_for_source_retry(
+                    f"could not open source {self._sanitize_source_url(source)}"
+                )
                 continue
 
             source_fps = self._capture_fps(capture)
@@ -659,7 +718,9 @@ class DroneWorker:
                 capture.release()
             self._mark_source_closed(last_error="")
             if not self._stop_event.is_set():
-                time.sleep(self.settings.reconnect_delay_seconds)
+                runtime = self.runtime_snapshot()
+                retry_reason = str(runtime.get("lastSourceError") or "source stream ended")
+                self._wait_for_source_retry(retry_reason)
 
     def _process_image_source(self, source_path: Path) -> None:
         image_paths = self._resolve_image_paths(source_path)
@@ -681,13 +742,16 @@ class DroneWorker:
                 pipeline_fps = float(pipeline.get("processingFps") or self.settings.processing_fps)
                 captured_at = utc_now()
                 self._record_captured_frame(captured_at=captured_at, queue_depth=0, dropped=0)
-                self._process_frame(
-                    frame,
-                    source_fps=pipeline_fps,
-                    pipeline=pipeline,
-                    frame_age_ms=0.0,
-                    captured_at=captured_at,
-                )
+                try:
+                    self._process_frame(
+                        frame,
+                        source_fps=pipeline_fps,
+                        pipeline=pipeline,
+                        frame_age_ms=0.0,
+                        captured_at=captured_at,
+                    )
+                except Exception as error:
+                    self._handle_frame_processing_error(error)
                 time.sleep(1.0 / max(0.5, pipeline_fps))
 
     def _run_capture_session(
@@ -702,17 +766,47 @@ class DroneWorker:
         frame_queue: LatestFrameQueue[np.ndarray] = LatestFrameQueue()
         session_stop = threading.Event()
         capture_failed = threading.Event()
+        session_started_at = time.monotonic()
+        last_capture_progress_at = [session_started_at]
+        first_frame_at = [0.0]
+        failure_reason = [""]
+        source_stable = False
+        capture_stall_timeout = max(
+            float(getattr(self.settings, "rtsp_read_timeout_seconds", 5.0)),
+            float(
+                getattr(
+                    self.settings,
+                    "capture_stall_timeout_seconds",
+                    max(float(getattr(self.settings, "rtsp_read_timeout_seconds", 5.0)) * 2.0, 10.0),
+                )
+            ),
+        )
+        source_stable_reset_seconds = max(
+            1.0,
+            float(getattr(self.settings, "source_stable_reset_seconds", 10.0)),
+        )
 
         def capture_frames() -> None:
             sequence = 0
             while not self._stop_event.is_set() and not session_stop.is_set():
-                ok, frame = capture.read()
+                try:
+                    ok, frame = capture.read()
+                except Exception as error:
+                    if not failure_reason[0]:
+                        failure_reason[0] = f"source frame read error: {error}"
+                    capture_failed.set()
+                    break
                 if not ok or frame is None:
+                    if not failure_reason[0]:
+                        failure_reason[0] = "source frame read failed"
                     capture_failed.set()
                     break
 
                 sequence += 1
                 captured_monotonic = time.monotonic()
+                last_capture_progress_at[0] = captured_monotonic
+                if not first_frame_at[0]:
+                    first_frame_at[0] = captured_monotonic
                 captured_at = utc_now()
                 dropped = frame_queue.put_latest(
                     CapturedFrame(
@@ -752,6 +846,22 @@ class DroneWorker:
                 except Empty:
                     if capture_failed.is_set():
                         break
+                    stalled_for = time.monotonic() - last_capture_progress_at[0]
+                    if stalled_for >= capture_stall_timeout:
+                        failure_reason[0] = (
+                            "source frame capture stalled for "
+                            f"{stalled_for:.1f}s"
+                        )
+                        capture_failed.set()
+                        with self._lock:
+                            self._runtime["sourceStallCount"] = (
+                                int(self._runtime.get("sourceStallCount") or 0) + 1
+                            )
+                        # _FfmpegY4mReader.release() terminates the subprocess
+                        # and unblocks its stdout reader.  The finally block
+                        # below remains the authoritative cleanup path.
+                        capture.release()
+                        break
                     continue
 
                 captured, superseded = frame_queue.drain_to_latest(captured)
@@ -759,6 +869,15 @@ class DroneWorker:
                     self._record_dropped_before_inference(superseded)
                 if captured is None:
                     continue
+
+                if (
+                    not source_stable
+                    and first_frame_at[0]
+                    and time.monotonic() - first_frame_at[0]
+                    >= source_stable_reset_seconds
+                ):
+                    self._reset_source_retry_backoff()
+                    source_stable = True
 
                 if resolved_source_fps <= 0.0:
                     detected_source_fps = self._capture_fps(capture)
@@ -779,13 +898,16 @@ class DroneWorker:
                     (inference_started_at - captured.captured_monotonic) * 1000.0,
                 )
                 self._set_runtime(captureQueueDepth=frame_queue.qsize())
-                self._process_frame(
-                    captured.value,
-                    source_fps=resolved_source_fps,
-                    pipeline=pipeline,
-                    frame_age_ms=frame_age_ms,
-                    captured_at=captured.captured_at,
-                )
+                try:
+                    self._process_frame(
+                        captured.value,
+                        source_fps=resolved_source_fps,
+                        pipeline=pipeline,
+                        frame_age_ms=frame_age_ms,
+                        captured_at=captured.captured_at,
+                    )
+                except Exception as error:
+                    self._handle_frame_processing_error(error)
                 next_inference_at = inference_started_at + frame_interval
         finally:
             session_stop.set()
@@ -795,15 +917,16 @@ class DroneWorker:
             self._set_runtime(captureQueueDepth=0)
 
         if capture_failed.is_set() and not self._stop_event.is_set():
+            normalized_error = failure_reason[0] or "source frame read failed"
             self._stop_processed_publisher()
             self._clear_preview()
             self._set_runtime(
                 status="waiting_source",
-                message="source frame read failed",
+                message=normalized_error,
                 sourceOpened=False,
                 activeRtspConnections=0,
                 singleIngestHealthy=True,
-                lastSourceError="source frame read failed",
+                lastSourceError=normalized_error,
             )
 
     def _record_captured_frame(self, *, captured_at: str, queue_depth: int, dropped: int) -> None:
@@ -887,6 +1010,48 @@ class DroneWorker:
         except Exception:
             return 0.0
 
+    def _wait_interruptibly(self, delay_seconds: float) -> bool:
+        """Wait for retry delay, but wake immediately on stop or pipeline update."""
+
+        awakened = self._wake_event.wait(max(0.0, float(delay_seconds)))
+        if awakened and not self._stop_event.is_set():
+            self._wake_event.clear()
+        return awakened
+
+    def _wait_for_source_retry(self, reason: str) -> None:
+        if self._stop_event.is_set():
+            return
+        retry_max = max(
+            self.settings.reconnect_delay_seconds,
+            float(getattr(self.settings, "reconnect_delay_max_seconds", 30.0)),
+        )
+        delay = min(
+            max(self._source_retry_delay, self.settings.reconnect_delay_seconds),
+            retry_max,
+        )
+        self._source_retry_count += 1
+        self._set_runtime(
+            status="waiting_source",
+            message=f"{reason}; retrying source in {delay:.1f}s",
+            sourceOpened=False,
+            activeRtspConnections=0,
+            sourceRetryCount=self._source_retry_count,
+            sourceRetryDelaySeconds=round(delay, 2),
+            sourceStable=False,
+        )
+        self._source_retry_delay = min(
+            delay * 2.0,
+            retry_max,
+        )
+        self._wait_interruptibly(delay)
+
+    def _reset_source_retry_backoff(self) -> None:
+        self._source_retry_delay = self.settings.reconnect_delay_seconds
+        self._set_runtime(
+            sourceRetryDelaySeconds=0.0,
+            sourceStable=True,
+        )
+
     def _process_frame(
         self,
         frame,
@@ -902,9 +1067,7 @@ class DroneWorker:
 
         model_info = self._ensure_model(pipeline)
         if not model_info:
-            self._stop_processed_publisher()
             self._clear_processed_preview()
-            time.sleep(self.settings.reconnect_delay_seconds)
             return
 
         frame_height, frame_width = frame.shape[:2]
@@ -1659,30 +1822,152 @@ class DroneWorker:
             self._latest_detections = detections
 
     def _ensure_model(self, pipeline: dict[str, object]) -> dict[str, object] | None:
-        desired_model_id = str(pipeline.get("currentModelId") or "")
-        if self._model and self._model_id == desired_model_id:
-            return self.model_registry.get(self._model_id)
-
+        requested_model_id = str(pipeline.get("currentModelId") or "").strip()
+        desired_model_id = self.model_registry.canonical_id(requested_model_id)
         model_info = self.model_registry.get(desired_model_id)
+        registry_revision = self.model_registry.revision
+        catalog_error = self.model_registry.last_reload_error
+        model_signature = self._model_info_signature(model_info)
+
+        if (
+            self._model
+            and self._model_id == desired_model_id
+            and model_info
+            and self._model_loaded_signature == model_signature
+        ):
+            self._set_runtime(
+                modelRegistryRevision=registry_revision,
+                modelCatalogError=catalog_error,
+            )
+            return model_info
+
+        now = time.monotonic()
+        if now < self._model_retry_next_at:
+            self._set_runtime(
+                modelRegistryRevision=registry_revision,
+                modelCatalogError=catalog_error,
+            )
+            return None
+
         if not model_info:
-            self._set_runtime(status="model_error", message=f"model {desired_model_id} not found")
+            self._discard_loaded_model()
+            self._schedule_model_retry(
+                f"model {requested_model_id or desired_model_id} not found",
+                now=now,
+                registry_revision=registry_revision,
+                catalog_error=catalog_error,
+            )
             return None
         if not model_info.get("weightsPresent"):
-            self._set_runtime(
-                status="model_error",
-                message=f"weights missing for {desired_model_id}",
+            self._discard_loaded_model()
+            self._schedule_model_retry(
+                f"weights missing for {desired_model_id}",
+                now=now,
+                registry_revision=registry_revision,
+                catalog_error=catalog_error,
             )
             return None
         try:
-            self._model = YOLO(str(model_info["weightsPath"]))
+            loaded_model = YOLO(str(model_info["weightsPath"]))
+            self._model = loaded_model
             self._model_id = str(model_info["id"])
             self._model_name = str(model_info.get("name") or self._model_id)
-            self._set_runtime(status="running", message=f"model loaded: {self._model_name}")
+            self._model_loaded_signature = model_signature
+            self._model_registry_revision = registry_revision
+            self._reset_model_retry_backoff()
+            self._set_runtime(
+                status="running",
+                message=f"model loaded: {self._model_name}",
+                modelRegistryRevision=registry_revision,
+                modelCatalogError=catalog_error,
+            )
             return model_info
         except Exception as error:
-            self._set_runtime(status="model_error", message=f"could not load model: {error}")
-            self._model = None
+            self._discard_loaded_model()
+            self._schedule_model_retry(
+                f"could not load model {desired_model_id}: {error}",
+                now=now,
+                registry_revision=registry_revision,
+                catalog_error=catalog_error,
+            )
             return None
+
+    @staticmethod
+    def _model_info_signature(model_info: dict[str, object] | None) -> tuple[object, ...] | None:
+        if not model_info:
+            return None
+        weights_path = Path(str(model_info.get("weightsPath") or ""))
+        try:
+            weights_stat = weights_path.stat()
+            weights_signature: tuple[int, int] = (
+                int(weights_stat.st_mtime_ns),
+                int(weights_stat.st_size),
+            )
+        except OSError:
+            weights_signature = (0, 0)
+        return (
+            str(model_info.get("id") or ""),
+            str(weights_path),
+            weights_signature,
+            model_info.get("imageSize"),
+            model_info.get("iouThreshold"),
+            model_info.get("preprocessor"),
+            model_info.get("compositeIntermediateWidth"),
+            model_info.get("compositeNmsIou"),
+        )
+
+    def _schedule_model_retry(
+        self,
+        reason: str,
+        *,
+        now: float,
+        registry_revision: int,
+        catalog_error: str,
+    ) -> None:
+        retry_base = float(getattr(self.settings, "model_retry_seconds", 2.0))
+        retry_max = max(
+            retry_base,
+            float(getattr(self.settings, "model_retry_max_seconds", 30.0)),
+        )
+        delay = min(
+            max(self._model_retry_delay, retry_base),
+            retry_max,
+        )
+        self._model_retry_count += 1
+        self._model_retry_next_at = now + delay
+        self._model_retry_delay = min(
+            delay * 2.0,
+            retry_max,
+        )
+        self._set_runtime(
+            status="model_error",
+            message=f"{reason}; retrying model in {delay:.1f}s",
+            modelRetryCount=self._model_retry_count,
+            modelRetryDelaySeconds=round(delay, 2),
+            modelRegistryRevision=registry_revision,
+            modelCatalogError=catalog_error,
+        )
+
+    def _reset_model_retry_backoff(self) -> None:
+        self._model_retry_delay = float(getattr(self.settings, "model_retry_seconds", 2.0))
+        self._model_retry_next_at = 0.0
+        self._set_runtime(modelRetryDelaySeconds=0.0)
+
+    def _discard_loaded_model(self) -> None:
+        self._model = None
+        self._model_id = ""
+        self._model_name = ""
+        self._model_loaded_signature = None
+
+    def _handle_frame_processing_error(self, error: Exception) -> None:
+        self._discard_loaded_model()
+        self._clear_processed_preview()
+        self._schedule_model_retry(
+            f"frame processing failed: {error}",
+            now=time.monotonic(),
+            registry_revision=self.model_registry.revision,
+            catalog_error=self.model_registry.last_reload_error,
+        )
 
     def _encode_preview(self, frame) -> bytes | None:
         success, encoded = cv2.imencode(
@@ -1909,11 +2194,10 @@ class DroneWorker:
                     "processedPublisherFailureCount": failure_count,
                 }
             )
-        print(
+        safe_console_log(
             f"[drone-worker] processed publisher failure "
             f"drone={self.pipeline_id} count={failure_count} at={failed_at}: "
-            f"{normalized_reason}",
-            flush=True,
+            f"{normalized_reason}"
         )
 
     def _stop_processed_publisher(self, *, reset_retry: bool = True) -> None:
@@ -2122,6 +2406,7 @@ class DroneWorker:
                     "sourceSessionId": f"{self.pipeline_id}-source-{source_open_count}",
                     "sourceOpenCount": source_open_count,
                     "sourceReconnectCount": max(0, source_open_count - 1),
+                    "sourceStable": False,
                     "lastSourceOpenAt": utc_now(),
                     "lastSourceError": "",
                 }
